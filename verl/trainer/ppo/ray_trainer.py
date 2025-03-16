@@ -624,8 +624,7 @@ class RayPPOTrainer(object):
             colocated_cls_dict = {}
             for role, cls in class_dict.items():
                 colocated_cls_dict[role] = cls
-            colocated_worker_cls = create_colocated_worker_cls(colocated_cls_dict,
-                                                              RayClassWithInitArgs)
+            colocated_worker_cls = create_colocated_worker_cls(colocated_cls_dict)
 
             # create RayWorkerGroup
             worker_group = self.ray_worker_group_cls(colocated_worker_cls, resource_pool=resource_pool)
