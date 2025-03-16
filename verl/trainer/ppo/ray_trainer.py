@@ -48,6 +48,20 @@ try:
 except ImportError:
     from verl.utils.dataset import RLHFDataset, collate_fn
 
+import logging
+import time
+import math
+import yaml
+import traceback
+from contextlib import contextmanager
+import torch
+import numpy as np
+import pandas as pd
+import ray
+from omegaconf import OmegaConf
+
+from typing import Any, Dict, List, Optional
+
 WorkerType = Type[Worker]
 
 
@@ -547,57 +561,61 @@ class RayPPOTrainer(object):
         # Register worker classes with proper ray.remote wrapping
         print("Registering ActorRolloutRefWorker")
         ActorRolloutRefWorkerRemote = ray.remote(ActorRolloutRefWorker)
+        
+        # Convert OmegaConf to dict for serialization to prevent "config has no attribute actor" errors
+        # This aligns with our memory about replacing torch dtype objects with string representations
+        if hasattr(self.config, 'actor_rollout_ref'):
+            actor_config_dict = OmegaConf.to_container(self.config.actor_rollout_ref, resolve=True)
+            print(f"Actor config dict: {type(actor_config_dict)}")
+        else:
+            print("Warning: No actor_rollout_ref config found")
+            actor_config_dict = {}
+        
+        # IMPORTANT: Pass config and role as positional args, NOT kwargs
+        # This matches the signature of ActorRolloutRefWorker.__init__(self, config, role)
         self.resource_pool_to_cls[resource_pool][Role.ActorRollout.name] = RayClassWithInitArgs(
             ActorRolloutRefWorkerRemote,
-            kwargs=dict(
-                config=self.config.actor_rollout_ref,
-                tokenizer=self.tokenizer,
-                rollout_config=self.rollout_config
-            )
+            actor_config_dict,  # First positional argument (config)
+            "actor_rollout_ref"  # Second positional argument (role)
         )
         
         if self.use_critic:
             print("Registering CriticWorker")
             CriticWorkerRemote = ray.remote(CriticWorker)
+            
+            # Convert OmegaConf to dict for serialization
+            if hasattr(self.config, 'critic'):
+                critic_config_dict = OmegaConf.to_container(self.config.critic, resolve=True)
+                print(f"Critic config dict: {type(critic_config_dict)}")
+            else:
+                print("Warning: No critic config found")
+                critic_config_dict = {}
+                
+            # IMPORTANT: Pass config as positional arg, matching CriticWorker.__init__(self, config)
             self.resource_pool_to_cls[resource_pool][Role.Critic.name] = RayClassWithInitArgs(
                 CriticWorkerRemote,
-                kwargs=dict(
-                    config=self.config.critic,
-                    tokenizer=self.tokenizer
-                )
+                critic_config_dict  # First positional argument (config)
             )
         
-        # Add reward model worker if configured
-        if 'rm' in self.config and hasattr(self.config, 'rm'):
+        if self.use_rm:
+            print("Registering RewardModelWorker")
             rm_cls = ray.remote(RewardModelWorker)
+            
+            # Convert OmegaConf to dict for serialization
+            if hasattr(self.config, 'rm'):
+                rm_config_dict = OmegaConf.to_container(self.config.rm, resolve=True)
+                print(f"RM config dict: {type(rm_config_dict)}")
+            else:
+                print("Warning: No rm config found")
+                rm_config_dict = {}
+                
+            # IMPORTANT: Pass config as positional arg, matching RewardModelWorker.__init__(self, config)
             self.resource_pool_to_cls[resource_pool][Role.RewardModel.name] = RayClassWithInitArgs(
                 rm_cls,
-                kwargs=dict(
-                    config=self.config.rm,
-                    tokenizer=self.tokenizer
-                )
+                rm_config_dict  # First positional argument (config)
             )
         
-        # Initialize the worker group with the resource pool and ray classes
-        print("Initializing worker group")
-        
-        # We need to convert our dictionary of RayClassWithInitArgs to the format expected by RayWorkerGroup
-        # The RayWorkerGroup class expects a dictionary mapping from role names to RayClassWithInitArgs objects
-        worker_roles = {}
-        
-        # Map ActorRolloutRefWorker to ActorRollout role
-        if 'actor_rollout_ref' in self.resource_pool_to_cls[resource_pool]:
-            worker_roles[Role.ActorRollout.name] = self.resource_pool_to_cls[resource_pool]['actor_rollout_ref']
-            
-        # Map CriticWorker to Critic role
-        if 'critic' in self.resource_pool_to_cls[resource_pool]:
-            worker_roles[Role.Critic.name] = self.resource_pool_to_cls[resource_pool]['critic']
-            
-        # Map RewardModelWorker to RewardModel role
-        if 'rm' in self.resource_pool_to_cls[resource_pool]:
-            worker_roles[Role.RewardModel.name] = self.resource_pool_to_cls[resource_pool]['rm']
-        
-        print(f"Worker roles: {list(worker_roles.keys())}")
+        print(f"Worker roles: {list(self.resource_pool_to_cls[resource_pool].keys())}")
         
         # Initialize worker groups individually for each worker type
         print("Creating worker groups...")
@@ -606,62 +624,99 @@ class RayPPOTrainer(object):
         self.rm_wg = None
         self.wg_dicts = []
         
-        # Create the ActorRollout worker group
-        if 'actor_rollout_ref' in self.resource_pool_to_cls[resource_pool]:
-            print("Creating ActorRollout worker group")
-            try:
-                self.actor_rollout_wg = self.ray_worker_group_cls(
-                    resource_pool=resource_pool,
-                    ray_cls_with_init=self.resource_pool_to_cls[resource_pool]['actor_rollout_ref'],  # Pass a single RayClassWithInitArgs object
-                    bin_pack=True,
-                    name_prefix="actor_rollout_worker",
-                    detached=False
-                )
-                self.wg_dicts.append(self.actor_rollout_wg)
-                print("ActorRollout worker group created successfully")
-            except Exception as e:
-                print(f"Error creating ActorRollout worker group: {e}")
-                traceback.print_exc()
-                raise
-        
-        # Create the Critic worker group if configured
-        if 'critic' in self.resource_pool_to_cls[resource_pool]:
-            print("Creating Critic worker group")
-            try:
-                self.critic_wg = self.ray_worker_group_cls(
-                    resource_pool=resource_pool,
-                    ray_cls_with_init=self.resource_pool_to_cls[resource_pool]['critic'],  # Pass a single RayClassWithInitArgs object
-                    bin_pack=True,
-                    name_prefix="critic_worker",
-                    detached=False
-                )
-                self.wg_dicts.append(self.critic_wg)
-                print("Critic worker group created successfully")
-            except Exception as e:
-                print(f"Error creating Critic worker group: {e}")
-                traceback.print_exc()
-                raise
-        
-        # Create the RewardModel worker group if configured
-        if 'rm' in self.resource_pool_to_cls[resource_pool]:
-            print("Creating RewardModel worker group")
-            try:
-                self.rm_wg = self.ray_worker_group_cls(
-                    resource_pool=resource_pool,
-                    ray_cls_with_init=self.resource_pool_to_cls[resource_pool]['rm'],  # Pass a single RayClassWithInitArgs object
-                    bin_pack=True,
-                    name_prefix="reward_model_worker",
-                    detached=False
-                )
-                self.wg_dicts.append(self.rm_wg)
-                print("RewardModel worker group created successfully")
-            except Exception as e:
-                print(f"Error creating RewardModel worker group: {e}")
-                traceback.print_exc()
-                raise
-                
-        print(f"Created {len(self.wg_dicts)} worker groups")
-        
+        # Always create a single worker group for hybrid engine
+        if self.hybrid_engine:
+            # Create the ActorRollout worker group
+            if Role.ActorRollout.name in self.resource_pool_to_cls[resource_pool]:
+                print("Creating ActorRollout worker group")
+                try:
+                    print(f"ActorRollout Ray class: {self.resource_pool_to_cls[resource_pool][Role.ActorRollout.name].cls}")
+                    print(f"ActorRollout args: {self.resource_pool_to_cls[resource_pool][Role.ActorRollout.name].args}")
+                    print(f"ActorRollout kwargs: {self.resource_pool_to_cls[resource_pool][Role.ActorRollout.name].kwargs}")
+                    
+                    self.actor_rollout_wg = self.ray_worker_group_cls(
+                        resource_pool=resource_pool,
+                        ray_cls_with_init=self.resource_pool_to_cls[resource_pool][Role.ActorRollout.name],
+                        bin_pack=True,
+                        name_prefix="actor_rollout_worker",
+                        detached=False
+                    )
+                    self.wg_dicts.append(self.actor_rollout_wg)
+                    print("ActorRollout worker group created successfully")
+                except Exception as e:
+                    print(f"Error creating ActorRollout worker group: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+                    
+            # Create the Critic worker group if enabled
+            if self.use_critic and Role.Critic.name in self.resource_pool_to_cls[resource_pool]:
+                print("Creating Critic worker group")
+                try:
+                    print(f"Critic Ray class: {self.resource_pool_to_cls[resource_pool][Role.Critic.name].cls}")
+                    print(f"Critic args: {self.resource_pool_to_cls[resource_pool][Role.Critic.name].args}")
+                    print(f"Critic kwargs: {self.resource_pool_to_cls[resource_pool][Role.Critic.name].kwargs}")
+                    
+                    self.critic_wg = self.ray_worker_group_cls(
+                        resource_pool=resource_pool,
+                        ray_cls_with_init=self.resource_pool_to_cls[resource_pool][Role.Critic.name],
+                        bin_pack=True,
+                        name_prefix="critic_worker",
+                        detached=False
+                    )
+                    self.wg_dicts.append(self.critic_wg)
+                    print("Critic worker group created successfully")
+                except Exception as e:
+                    print(f"Error creating Critic worker group: {e}")
+                    traceback.print_exc()
+                    raise
+                    
+            # Create the RewardModel worker group if enabled
+            if self.use_rm and Role.RewardModel.name in self.resource_pool_to_cls[resource_pool]:
+                print("Creating RewardModel worker group")
+                try:
+                    print(f"RewardModel Ray class: {self.resource_pool_to_cls[resource_pool][Role.RewardModel.name].cls}")
+                    print(f"RewardModel args: {self.resource_pool_to_cls[resource_pool][Role.RewardModel.name].args}")
+                    print(f"RewardModel kwargs: {self.resource_pool_to_cls[resource_pool][Role.RewardModel.name].kwargs}")
+                    
+                    self.rm_wg = self.ray_worker_group_cls(
+                        resource_pool=resource_pool,
+                        ray_cls_with_init=self.resource_pool_to_cls[resource_pool][Role.RewardModel.name],
+                        bin_pack=True,
+                        name_prefix="reward_model_worker",
+                        detached=False
+                    )
+                    self.wg_dicts.append(self.rm_wg)
+                    print("RewardModel worker group created successfully")
+                except Exception as e:
+                    print(f"Error creating RewardModel worker group: {e}")
+                    traceback.print_exc()
+                    raise
+                    
+            print(f"Created {len(self.wg_dicts)} worker groups")
+        else:
+            # This branch shouldn't be entered since we have an assert in __init__
+            # But keeping this for completeness and future extension
+            print("WARNING: hybrid_engine is False, but it's required for worker initialization")
+            print("Defaulting to hybrid_engine mode")
+            
+            # Try to continue with hybrid_engine mode anyway
+            if Role.ActorRollout.name in self.resource_pool_to_cls[resource_pool]:
+                print("Creating ActorRollout worker group in fallback mode")
+                try:
+                    self.actor_rollout_wg = self.ray_worker_group_cls(
+                        resource_pool=resource_pool,
+                        ray_cls_with_init=self.resource_pool_to_cls[resource_pool][Role.ActorRollout.name],
+                        bin_pack=True,
+                        name_prefix="actor_rollout_worker_fallback",
+                        detached=False
+                    )
+                    self.wg_dicts.append(self.actor_rollout_wg)
+                    print("ActorRollout worker group created successfully in fallback mode")
+                except Exception as e:
+                    print(f"Error creating ActorRollout worker group in fallback mode: {e}")
+                    traceback.print_exc()
+                    raise
         # Direct fix for the worker method issue
         # The issue is that the worker methods aren't properly exposed through Ray
         # This modification explicitly forwards important methods to the actual worker instance
