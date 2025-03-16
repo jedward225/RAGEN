@@ -627,7 +627,7 @@ class RayPPOTrainer(object):
             colocated_worker_cls = create_colocated_worker_cls(colocated_cls_dict)
 
             # create RayWorkerGroup
-            worker_group = self.ray_worker_group_cls(colocated_worker_cls, resource_pool=resource_pool)
+            worker_group = self.ray_worker_group_cls(ray_cls_with_init=colocated_worker_cls, resource_pool=resource_pool)
             self.wg_dicts.append(worker_group)
             for role in class_dict.keys():
                 all_wg[role] = worker_group
@@ -635,17 +635,101 @@ class RayPPOTrainer(object):
         # create worker shortcuts
         if self.hybrid_engine:
             self.actor_rollout_wg = all_wg['actor_rollout']
+            
+            # Monkey patch the specific worker group instance with the needed methods
+            # This is a more direct approach than modifying the class
+            if not hasattr(self.actor_rollout_wg, 'generate_sequences'):
+                def generate_sequences(self_wg, prompts, **kwargs):
+                    """Forward generate_sequences to the first worker and wait for result"""
+                    ref = self_wg._workers[0].generate_sequences.remote(prompts, **kwargs)
+                    return ray.get(ref)
+                
+                # Bind the method directly to this instance
+                import types
+                self.actor_rollout_wg.generate_sequences = types.MethodType(generate_sequences, self.actor_rollout_wg)
+                print("[INFO] Added generate_sequences method to actor_rollout worker group")
+            
+            # Add compute_log_prob method
+            if not hasattr(self.actor_rollout_wg, 'compute_log_prob'):
+                def compute_log_prob(self_wg, batch, **kwargs):
+                    """Forward compute_log_prob to the first worker and wait for result"""
+                    ref = self_wg._workers[0].compute_log_prob.remote(batch, **kwargs)
+                    return ray.get(ref)
+                
+                self.actor_rollout_wg.compute_log_prob = types.MethodType(compute_log_prob, self.actor_rollout_wg)
+                print("[INFO] Added compute_log_prob method to actor_rollout worker group")
+            
+            # Add compute_ref_log_prob method if reference policy is used
+            if self.use_reference_policy and not hasattr(self.actor_rollout_wg, 'compute_ref_log_prob'):
+                def compute_ref_log_prob(self_wg, batch, **kwargs):
+                    """Forward compute_ref_log_prob to the first worker and wait for result"""
+                    ref = self_wg._workers[0].compute_ref_log_prob.remote(batch, **kwargs)
+                    return ray.get(ref)
+                
+                self.actor_rollout_wg.compute_ref_log_prob = types.MethodType(compute_ref_log_prob, self.actor_rollout_wg)
+                print("[INFO] Added compute_ref_log_prob method to actor_rollout worker group")
+            
+            # Add update_actor method
+            if not hasattr(self.actor_rollout_wg, 'update_actor'):
+                def update_actor(self_wg, batch, **kwargs):
+                    """Forward update_actor to the first worker and wait for result"""
+                    ref = self_wg._workers[0].update_actor.remote(batch, **kwargs)
+                    return ray.get(ref)
+                
+                self.actor_rollout_wg.update_actor = types.MethodType(update_actor, self.actor_rollout_wg)
+                print("[INFO] Added update_actor method to actor_rollout worker group")
+            
+            # Add save_checkpoint method
+            if not hasattr(self.actor_rollout_wg, 'save_checkpoint'):
+                def save_checkpoint(self_wg, local_path, remote_path, **kwargs):
+                    """Forward save_checkpoint to the first worker and wait for result"""
+                    ref = self_wg._workers[0].save_checkpoint.remote(local_path, remote_path, **kwargs)
+                    return ray.get(ref)
+                
+                self.actor_rollout_wg.save_checkpoint = types.MethodType(save_checkpoint, self.actor_rollout_wg)
+                print("[INFO] Added save_checkpoint method to actor_rollout worker group")
+            
+            # Add load_model_parameters method
+            if not hasattr(self.actor_rollout_wg, 'load_model_parameters'):
+                def load_model_parameters(self_wg, source_model_path, **kwargs):
+                    """Forward load_model_parameters to the first worker and wait for result"""
+                    ref = self_wg._workers[0].load_model_parameters.remote(source_model_path, **kwargs)
+                    return ray.get(ref)
+                
+                self.actor_rollout_wg.load_model_parameters = types.MethodType(load_model_parameters, self.actor_rollout_wg)
+                print("[INFO] Added load_model_parameters method to actor_rollout worker group")
+            
+            # Add compute_values method if critic is used
+            if self.use_critic and not hasattr(self.actor_rollout_wg, 'compute_values'):
+                def compute_values(self_wg, batch, **kwargs):
+                    """Forward compute_values to the first worker and wait for result"""
+                    ref = self_wg._workers[0].compute_values.remote(batch, **kwargs)
+                    return ray.get(ref)
+                
+                self.actor_rollout_wg.compute_values = types.MethodType(compute_values, self.actor_rollout_wg)
+                print("[INFO] Added compute_values method to actor_rollout worker group")
+            
+            # Add update_critic method if critic is used
+            if self.use_critic and not hasattr(self.actor_rollout_wg, 'update_critic'):
+                def update_critic(self_wg, batch, **kwargs):
+                    """Forward update_critic to the first worker and wait for result"""
+                    ref = self_wg._workers[0].update_critic.remote(batch, **kwargs)
+                    return ray.get(ref)
+                
+                self.actor_rollout_wg.update_critic = types.MethodType(update_critic, self.actor_rollout_wg)
+                print("[INFO] Added update_critic method to actor_rollout worker group")
+            
+            # Add compute_rm_score method if reward model is used
+            if self.use_rm and not hasattr(self.actor_rollout_wg, 'compute_rm_score'):
+                def compute_rm_score(self_wg, batch, **kwargs):
+                    """Forward compute_rm_score to the first worker and wait for result"""
+                    ref = self_wg._workers[0].compute_rm_score.remote(batch, **kwargs)
+                    return ray.get(ref)
+                
+                self.actor_rollout_wg.compute_rm_score = types.MethodType(compute_rm_score, self.actor_rollout_wg)
+                print("[INFO] Added compute_rm_score method to actor_rollout worker group")
         else:
             raise NotImplementedError
-
-        if self.use_critic:
-            self.critic_wg = all_wg['critic']
-            
-        if self.use_reference_policy:
-            self.ref_wg = all_wg['ref']
-            
-        if self.use_rm:
-            self.rm_wg = all_wg['rm']
 
     def _save_checkpoint(self):
         actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
