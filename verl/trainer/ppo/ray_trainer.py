@@ -27,13 +27,12 @@ from typing import Dict, List, Tuple, Type
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
+from contextlib import contextmanager
 
 import numpy as np
 import torch
 import ray
-from codetiming import Timer
 from omegaconf import OmegaConf, open_dict, read_write
-
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.base import Worker
 from verl.single_controller.ray.base import RayWorkerGroup, RayResourcePool, RayClassWithInitArgs
@@ -330,9 +329,12 @@ def compute_timing_metrics(batch, timing_raw):
 
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
-    with Timer(name=name, logger=None) as timer:
+    start_time = time.time()
+    try:
         yield
-    timing_raw[name] = timer.last
+    finally:
+        elapsed_time = time.time() - start_time
+        timing_raw[name] = elapsed_time
 
 
 class RayPPOTrainer(object):
@@ -379,7 +381,29 @@ class RayPPOTrainer(object):
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.use_critic = Role.Critic in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
-
+        
+        # Initialize rollout_config from actor_rollout_ref config
+        self.rollout_config = {}
+        if hasattr(self.config, 'actor_rollout_ref') and hasattr(self.config.actor_rollout_ref, 'rollout'):
+            self.rollout_config = OmegaConf.to_container(self.config.actor_rollout_ref.rollout, resolve=True)
+            print(f"Initialized rollout_config: {self.rollout_config}")
+        else:
+            print("Warning: No rollout configuration found in actor_rollout_ref")
+            
+        # Check CUDA availability and handle systems without GPUs
+        if not torch.cuda.is_available():
+            print("WARNING: CUDA is not available. Running in CPU mode.")
+            # Adjust configurations that might depend on GPU availability
+            if 'device' in self.rollout_config:
+                self.rollout_config['device'] = 'cpu'
+            # Set GPU memory utilization to 0 if it exists
+            if 'gpu_memory_utilization' in self.rollout_config:
+                self.rollout_config['gpu_memory_utilization'] = 0
+        
+        # Create a ray context if not already initialized
+        if not ray.is_initialized():
+            ray.init()
+        
         self.val_num = 0
 
         # define KL control
@@ -510,7 +534,7 @@ class RayPPOTrainer(object):
         
         # Create a proper RayResourcePool instance
         resource_pool = RayResourcePool(
-            process_on_nodes=[0],  # Use the current node
+            process_on_nodes=[1],  # One process per node
             use_gpu=True,
             name_prefix="worker_pool",
             detached=False
@@ -543,221 +567,101 @@ class RayPPOTrainer(object):
                 )
             )
         
-        # Create worker groups
-        self.wg_dicts = []
-        
-        config = OmegaConf.to_container(self.config, resolve=True)
-
-        # Create the actor, rollout and ref workers
-        # Check if 'roles' exists in the configuration, if not, provide default roles
-        if 'actor_rollout_ref' not in config:
-            print("Warning: actor_rollout_ref configuration not found, using default configuration")
-            config['actor_rollout_ref'] = {}
-            
-        if 'roles' not in config['actor_rollout_ref']:
-            print("Warning: roles not defined in actor_rollout_ref, setting default roles [actor, rollout]")
-            config['actor_rollout_ref']['roles'] = ['actor', 'rollout']
-            
-        has_rollout_role = 'rollout' in config['actor_rollout_ref']['roles']
-        has_actor_role = 'actor' in config['actor_rollout_ref']['roles']
-        has_ref_role = 'ref' in config['actor_rollout_ref']['roles']
-
-        # Initialize worker arguments
-        worker_kwargs = {}
-        
-        # Check for required config sections
-        has_ref_config = 'ref' in config
-        if has_ref_role and not has_ref_config:
-            print("[WARNING] RefPolicy role is defined but config.ref is missing. Skipping reference policy initialization.")
-            has_ref_role = False
-            
-        # Safely access config sections using get() to avoid KeyError
-        ref_config = config.get('ref', {}) if has_ref_config else {}
-        rm_config = config.get('rm', {}) if 'rm' in config else {}
-        critic_config = config.get('critic', {}) if 'critic' in config else {}
-        
-        # Only add configs that exist
-        actor_rollout_ref_kwargs = {'args': (), 'kwargs': {'config': config}}
-        worker_kwargs['actor_rollout_ref'] = actor_rollout_ref_kwargs
-
-        # Only initialize critic if config exists
-        if 'critic' in config:
-            critic_kwargs = {'args': (), 'kwargs': {'config': critic_config}}
-            worker_kwargs['critic'] = critic_kwargs
-
-        # Only initialize reward model if config exists
-        if 'rm' in config:
-            rm_kwargs = {'args': (), 'kwargs': {'config': rm_config}}
-            worker_kwargs['rm'] = rm_kwargs
-
-        # Create a resource pool for the worker group
-        # This is needed because the WorkerGroup expects a ResourcePool object, not a dict
-        print("Creating resource pool for worker group")
-        resource_pool = RayResourcePool(
-            process_on_nodes=[1],  # One process per node
-            use_gpu=True,
-            name_prefix="worker_pool",
-            detached=False
-        )
-        
-        # Create RayClassWithInitArgs objects for each worker class
-        print("Creating RayClassWithInitArgs objects")
-        ray_cls_with_init = {}
-        
-        # Add actor_rollout_ref worker
-        actor_rollout_ref_cls = ray.remote(ActorRolloutRefWorker)
-        actor_rollout_ref_kwargs = worker_kwargs.get('actor_rollout_ref', {}).get('kwargs', {})
-        ray_cls_with_init['actor_rollout_ref'] = RayClassWithInitArgs(
-            actor_rollout_ref_cls,
-            **actor_rollout_ref_kwargs
-        )
-        
-        # Add critic worker if configured
-        if 'critic' in config and 'critic' in worker_kwargs:
-            critic_cls = ray.remote(CriticWorker)
-            critic_kwargs = worker_kwargs.get('critic', {}).get('kwargs', {})
-            ray_cls_with_init['critic'] = RayClassWithInitArgs(
-                critic_cls,
-                **critic_kwargs
-            )
-        
         # Add reward model worker if configured
-        if 'rm' in config and 'rm' in worker_kwargs:
+        if 'rm' in self.config and hasattr(self.config, 'rm'):
             rm_cls = ray.remote(RewardModelWorker)
-            rm_kwargs = worker_kwargs.get('rm', {}).get('kwargs', {})
-            ray_cls_with_init['rm'] = RayClassWithInitArgs(
+            self.resource_pool_to_cls[resource_pool][Role.RewardModel.name] = RayClassWithInitArgs(
                 rm_cls,
-                **rm_kwargs
+                kwargs=dict(
+                    config=self.config.rm,
+                    tokenizer=self.tokenizer
+                )
             )
         
         # Initialize the worker group with the resource pool and ray classes
         print("Initializing worker group")
-        worker_group = self.ray_worker_group_cls(
-            resource_pool=resource_pool,
-            ray_cls_with_init=ray_cls_with_init,
-            bin_pack=True,
-            name_prefix="ppo_workers",
-            detached=False
-        )
-
-        # Initialize worker group list with the created worker group
-        self.wg_dicts = [worker_group]
         
-        # Initialize resource_pool_to_cls
-        self.resource_pool_to_cls = {resource_pool: {}}
+        # We need to convert our dictionary of RayClassWithInitArgs to the format expected by RayWorkerGroup
+        # The RayWorkerGroup class expects a dictionary mapping from role names to RayClassWithInitArgs objects
+        worker_roles = {}
         
-        # Setup rollout worker config
-        print("Setting up rollout config")
-        self.rollout_config = OmegaConf.create()
-        with open_dict(self.rollout_config):
-            self.rollout_config.training = OmegaConf.create()
-            self.rollout_config.training.stop_token = self.tokenizer.eos_token_id
-            self.rollout_config.training.pad_token = self.tokenizer.pad_token_id
+        # Map ActorRolloutRefWorker to ActorRollout role
+        if 'actor_rollout_ref' in self.resource_pool_to_cls[resource_pool]:
+            worker_roles[Role.ActorRollout.name] = self.resource_pool_to_cls[resource_pool]['actor_rollout_ref']
             
-            # Convert torch.dtype to string for OmegaConf compatibility
-            # Important: Use strings for torch data types with OmegaConf
-            if hasattr(self.config.actor_rollout_ref, 'model') and hasattr(self.config.actor_rollout_ref.model, 'torch_dtype'):
-                if isinstance(self.config.actor_rollout_ref.model.torch_dtype, str):
-                    # Config already has string representation
-                    self.rollout_config.training.torch_dtype = self.config.actor_rollout_ref.model.torch_dtype
-                elif hasattr(self.config.actor_rollout_ref.model.torch_dtype, '__name__'):
-                    # Handle torch dtype objects by converting to string
-                    self.rollout_config.training.torch_dtype = f"torch.{self.config.actor_rollout_ref.model.torch_dtype.__name__}"
-                else:
-                    # Default to float16 if unavailable
-                    self.rollout_config.training.torch_dtype = 'torch.float16'
-            else:
-                self.rollout_config.training.torch_dtype = 'torch.float16'
-                
-            # Set attn_implementation if present in config, otherwise default to "flash_attention_2"
-            if hasattr(self.config.actor_rollout_ref, 'model') and hasattr(self.config.actor_rollout_ref.model, 'attn_implementation'):
-                self.rollout_config.training.attn_implementation = self.config.actor_rollout_ref.model.attn_implementation
-            else:
-                # Check if CUDA is available before defaulting to flash attention
-                if torch.cuda.is_available():
-                    self.rollout_config.training.attn_implementation = "flash_attention_2"
-                else:
-                    print("CUDA not available, using eager attention implementation")
-                    self.rollout_config.training.attn_implementation = "eager"
+        # Map CriticWorker to Critic role
+        if 'critic' in self.resource_pool_to_cls[resource_pool]:
+            worker_roles[Role.Critic.name] = self.resource_pool_to_cls[resource_pool]['critic']
             
-            # Add required training parameters
-            min_response_length = 0
-            if hasattr(self.config, 'data') and hasattr(self.config.data, 'min_response_length'):
-                min_response_length = self.config.data.min_response_length
-            self.rollout_config.training.min_length = min_response_length
-            
-            max_length = 400  # Default value
-            if hasattr(self.config, 'data') and hasattr(self.config.data, 'max_response_length'):
-                max_length = self.config.data.max_response_length
-            self.rollout_config.training.max_length = max_length
-            
-            self.rollout_config.training.temperature = 0.7
-            if hasattr(self.config.actor_rollout_ref, 'rollout') and hasattr(self.config.actor_rollout_ref.rollout, 'temperature'):
-                self.rollout_config.training.temperature = self.config.actor_rollout_ref.rollout.temperature
-            
-            self.rollout_config.training.num_return_sequences = 1
-            
-            # Access max_obs_length safely
-            max_obs_length = 200  # Default value
-            if hasattr(self.config, 'data') and hasattr(self.config.data, 'max_obs_length'):
-                max_obs_length = self.config.data.max_obs_length
-            self.rollout_config.training.max_obs_length = max_obs_length
+        # Map RewardModelWorker to RewardModel role
+        if 'rm' in self.resource_pool_to_cls[resource_pool]:
+            worker_roles[Role.RewardModel.name] = self.resource_pool_to_cls[resource_pool]['rm']
         
-        if self.hybrid_engine:
+        print(f"Worker roles: {list(worker_roles.keys())}")
+        
+        # Initialize worker groups individually for each worker type
+        print("Creating worker groups...")
+        self.actor_rollout_wg = None
+        self.critic_wg = None
+        self.rm_wg = None
+        self.wg_dicts = []
+        
+        # Create the ActorRollout worker group
+        if 'actor_rollout_ref' in self.resource_pool_to_cls[resource_pool]:
+            print("Creating ActorRollout worker group")
             try:
-                print("Setting up hybrid engine workers")
-                
-                # Get the ActorRollout configuration
-                actor_rollout_config = self.config.actor_rollout_ref.copy()
-                
-                # Ensure we have a model section
-                if not hasattr(actor_rollout_config, 'model'):
-                    with open_dict(actor_rollout_config):
-                        actor_rollout_config.model = OmegaConf.create()
-                
-                # Apply the rollout config settings
-                with open_dict(actor_rollout_config):
-                    actor_rollout_config.model.torch_dtype = self.rollout_config.training.torch_dtype
-                    actor_rollout_config.model.attn_implementation = self.rollout_config.training.attn_implementation
-                
-                # Create a single worker group for the actor_rollout worker
-                actor_rollout_worker = self.resource_pool_to_cls[resource_pool][Role.ActorRollout.name]
-                
-                print(f"Creating worker group for ActorRolloutRefWorker")
-                worker_group = self.ray_worker_group_cls(
+                self.actor_rollout_wg = self.ray_worker_group_cls(
                     resource_pool=resource_pool,
-                    ray_cls_with_init=actor_rollout_worker,
+                    ray_cls_with_init=self.resource_pool_to_cls[resource_pool]['actor_rollout_ref'],  # Pass a single RayClassWithInitArgs object
                     bin_pack=True,
-                    name_prefix="actor_rollout_workers",
+                    name_prefix="actor_rollout_worker",
                     detached=False
                 )
-                
-                # Add this worker group to our list and create a shortcut
-                self.wg_dicts.append(worker_group)
-                self.actor_rollout_wg = worker_group
-                print("Successfully created actor_rollout_wg")
-                
+                self.wg_dicts.append(self.actor_rollout_wg)
+                print("ActorRollout worker group created successfully")
             except Exception as e:
-                print(f"Error in hybrid_engine worker initialization: {str(e)}")
+                print(f"Error creating ActorRollout worker group: {e}")
                 traceback.print_exc()
                 raise
-        else:
-            raise NotImplementedError
-
-        # Create worker shortcuts (only if the corresponding worker exists)
-        # Make sure to check both flag and presence in all_wg
-        if self.hybrid_engine and Role.ActorRollout.name in self.resource_pool_to_cls[resource_pool]:
-            self.actor_rollout_wg = worker_group
         
-        if self.use_critic and Role.Critic.name in self.resource_pool_to_cls[resource_pool]:
-            self.critic_wg = worker_group
-            
-        if self.use_reference_policy and Role.RefPolicy.name in self.resource_pool_to_cls[resource_pool]:
-            self.ref_wg = worker_group
-            
-        if self.use_rm and Role.RewardModel.name in self.resource_pool_to_cls[resource_pool]:
-            self.rm_wg = worker_group
-            
+        # Create the Critic worker group if configured
+        if 'critic' in self.resource_pool_to_cls[resource_pool]:
+            print("Creating Critic worker group")
+            try:
+                self.critic_wg = self.ray_worker_group_cls(
+                    resource_pool=resource_pool,
+                    ray_cls_with_init=self.resource_pool_to_cls[resource_pool]['critic'],  # Pass a single RayClassWithInitArgs object
+                    bin_pack=True,
+                    name_prefix="critic_worker",
+                    detached=False
+                )
+                self.wg_dicts.append(self.critic_wg)
+                print("Critic worker group created successfully")
+            except Exception as e:
+                print(f"Error creating Critic worker group: {e}")
+                traceback.print_exc()
+                raise
+        
+        # Create the RewardModel worker group if configured
+        if 'rm' in self.resource_pool_to_cls[resource_pool]:
+            print("Creating RewardModel worker group")
+            try:
+                self.rm_wg = self.ray_worker_group_cls(
+                    resource_pool=resource_pool,
+                    ray_cls_with_init=self.resource_pool_to_cls[resource_pool]['rm'],  # Pass a single RayClassWithInitArgs object
+                    bin_pack=True,
+                    name_prefix="reward_model_worker",
+                    detached=False
+                )
+                self.wg_dicts.append(self.rm_wg)
+                print("RewardModel worker group created successfully")
+            except Exception as e:
+                print(f"Error creating RewardModel worker group: {e}")
+                traceback.print_exc()
+                raise
+                
+        print(f"Created {len(self.wg_dicts)} worker groups")
+        
         # Direct fix for the worker method issue
         # The issue is that the worker methods aren't properly exposed through Ray
         # This modification explicitly forwards important methods to the actual worker instance
@@ -799,8 +703,6 @@ class RayPPOTrainer(object):
                 worker_groups.append(('actor_rollout_wg', self.actor_rollout_wg))
             if hasattr(self, 'critic_wg') and hasattr(self.critic_wg, '_workers') and len(self.critic_wg._workers) > 0:
                 worker_groups.append(('critic_wg', self.critic_wg))
-            if hasattr(self, 'ref_wg') and hasattr(self.ref_wg, '_workers') and len(self.ref_wg._workers) > 0:
-                worker_groups.append(('ref_wg', self.ref_wg))
             if hasattr(self, 'rm_wg') and hasattr(self.rm_wg, '_workers') and len(self.rm_wg._workers) > 0:
                 worker_groups.append(('rm_wg', self.rm_wg))
                 
@@ -815,6 +717,9 @@ class RayPPOTrainer(object):
                             print(f"[INFO] Added '{method_name}' method to {group_name}")
                         except Exception as e:
                             print(f"[WARNING] Failed to add method '{method_name}' to {group_name}: {e}")
+        else:
+            raise NotImplementedError
+
     def _save_checkpoint(self):
         actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
                                         f'global_step_{self.global_steps}')
