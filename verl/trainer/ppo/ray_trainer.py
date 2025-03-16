@@ -362,6 +362,7 @@ class RayPPOTrainer(object):
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
         self.use_rm = Role.RewardModel in role_worker_mapping
+        self.use_critic = Role.Critic in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
 
         self.val_num = 0
@@ -536,49 +537,49 @@ class RayPPOTrainer(object):
                 actor_rollout_config.model.attn_implementation = self.rollout_config.training.attn_implementation
             
             # Add to resource pool with proper key - use string key matching the role
-            self.resource_pool_to_cls[resource_pool][Role.ActorRollout.name.lower()] = RayClassWithInitArgs(
+            self.resource_pool_to_cls[resource_pool][Role.ActorRollout.name] = RayClassWithInitArgs(
                 self.role_worker_mapping[Role.ActorRollout],
                 kwargs={
                     'config': actor_rollout_config,
                     'tokenizer': self.tokenizer,
                     'rollout_config': self.rollout_config,
-                    'role': Role.ActorRollout.name.lower()
+                    'role': Role.ActorRollout.name
                 }
             )
             
             # If critic is needed, set it up similarly
             if self.use_critic:
                 resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-                self.resource_pool_to_cls[resource_pool][Role.Critic.name.lower()] = RayClassWithInitArgs(
+                self.resource_pool_to_cls[resource_pool][Role.Critic.name] = RayClassWithInitArgs(
                     self.role_worker_mapping[Role.Critic],
                     kwargs={
                         'config': self.config.critic,
                         'tokenizer': self.tokenizer,
-                        'role': Role.Critic.name.lower()
+                        'role': Role.Critic.name
                     }
                 )
                 
             # Set up reference policy if needed
             if self.use_reference_policy:
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.Ref)
-                self.resource_pool_to_cls[resource_pool][Role.Ref.name.lower()] = RayClassWithInitArgs(
-                    self.role_worker_mapping[Role.Ref],
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+                self.resource_pool_to_cls[resource_pool][Role.RefPolicy.name] = RayClassWithInitArgs(
+                    self.role_worker_mapping[Role.RefPolicy],
                     kwargs={
                         'config': self.config.ref,
                         'tokenizer': self.tokenizer,
-                        'role': Role.Ref.name.lower()
+                        'role': Role.RefPolicy.name
                     }
                 )
                 
             # Set up reward model if needed
             if self.use_rm:
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RM)
-                self.resource_pool_to_cls[resource_pool][Role.RM.name.lower()] = RayClassWithInitArgs(
-                    self.role_worker_mapping[Role.RM],
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+                self.resource_pool_to_cls[resource_pool][Role.RewardModel.name] = RayClassWithInitArgs(
+                    self.role_worker_mapping[Role.RewardModel],
                     kwargs={
                         'config': self.config.rm,
                         'tokenizer': self.tokenizer,
-                        'role': Role.RM.name.lower()
+                        'role': Role.RewardModel.name
                     }
                 )
             
@@ -595,7 +596,7 @@ class RayPPOTrainer(object):
             colocated_worker_cls = create_colocated_worker_cls(colocated_cls_dict)
 
             # create RayWorkerGroup
-            worker_group = RayWorkerGroup(
+            worker_group = self.ray_worker_group_cls(
                 resource_pool=resource_pool,
                 ray_cls_with_init=colocated_worker_cls,
                 bin_pack=True
@@ -606,16 +607,16 @@ class RayPPOTrainer(object):
 
         # create worker shortcuts
         if self.hybrid_engine:
-            self.actor_rollout_wg = all_wg[Role.ActorRollout.name.lower()]
+            self.actor_rollout_wg = all_wg[Role.ActorRollout.name]
         
         if self.use_critic:
-            self.critic_wg = all_wg[Role.Critic.name.lower()]
+            self.critic_wg = all_wg[Role.Critic.name]
             
         if self.use_reference_policy:
-            self.ref_wg = all_wg[Role.Ref.name.lower()]
+            self.ref_wg = all_wg[Role.RefPolicy.name]
             
         if self.use_rm:
-            self.rm_wg = all_wg[Role.RM.name.lower()]
+            self.rm_wg = all_wg[Role.RewardModel.name]
             
         # Direct fix for the worker method issue
         # The issue is that the worker methods aren't properly exposed through Ray
