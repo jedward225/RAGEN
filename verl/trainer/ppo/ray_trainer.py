@@ -18,6 +18,9 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import os
 import uuid
+import ray
+import logging
+import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -29,6 +32,7 @@ import json
 from collections import defaultdict
 
 import numpy as np
+import torch
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from verl import DataProto
@@ -38,7 +42,8 @@ from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClass
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
-
+from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker, RewardModelWorker
+from verl.utils.torch_functional import masked_mean
 
 import re
 from ragen.llm_agent.generation import LLMGenerationManager, GenerationConfig
@@ -83,10 +88,6 @@ class ResourcePoolManager:
     def get_resource_pool(self, role: Role) -> RayResourcePool:
         """Get the resource pool of the worker_cls"""
         return self.resource_pool_dict[self.mapping[role]]
-
-
-import torch
-from verl.utils.torch_functional import masked_mean
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
@@ -511,32 +512,17 @@ class RayPPOTrainer(object):
         # Initialize ray worker classes with better error handling
         ray_classes = {}
         
-        # Make sure ActorRolloutRefWorker is available before adding it
-        try:
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker
-            ray_classes['actor_rollout_ref'] = ray.remote(ActorRolloutRefWorker)
-            print("Successfully registered ActorRolloutRefWorker")
-        except Exception as e:
-            print(f"Error importing ActorRolloutRefWorker: {str(e)}")
-            raise
+        # Register worker classes
+        print("Registering ActorRolloutRefWorker")
+        ray_classes['actor_rollout_ref'] = ray.remote(ActorRolloutRefWorker)
         
         if 'critic' in config:
-            try:
-                from verl.workers.fsdp_workers import CriticWorker
-                ray_classes['critic'] = ray.remote(CriticWorker)
-                print("Successfully registered CriticWorker")
-            except Exception as e:
-                print(f"Error importing CriticWorker: {str(e)}")
-                # Not raising error as critic is optional
+            print("Registering CriticWorker")
+            ray_classes['critic'] = ray.remote(CriticWorker)
         
         if 'rm' in config:
-            try:
-                from verl.workers.fsdp_workers import RewardModelWorker
-                ray_classes['rm'] = ray.remote(RewardModelWorker)
-                print("Successfully registered RewardModelWorker")
-            except Exception as e:
-                print(f"Error importing RewardModelWorker: {str(e)}")
-                # Not raising error as reward model is optional
+            print("Registering RewardModelWorker")
+            ray_classes['rm'] = ray.remote(RewardModelWorker)
         
         worker_group = self.ray_worker_group_cls(
             ray_classes, worker_kwargs, preemptible_node_type="gpu_p4",
@@ -607,109 +593,62 @@ class RayPPOTrainer(object):
         if self.hybrid_engine:
             # create actor_rollout class for the hybrid engine
             try:
-                if not hasattr(self, 'role_worker_mapping') or not self.role_worker_mapping:
-                    print("Warning: role_worker_mapping not initialized properly")
-                    
-                if Role.ActorRollout not in self.role_worker_mapping:
-                    print(f"Warning: ActorRollout role not found in role_worker_mapping. Available roles: {list(self.role_worker_mapping.keys())}")
-                    # Create a fallback mechanism
-                    from verl.workers.fsdp_workers import ActorRolloutRefWorker
-                    self.role_worker_mapping[Role.ActorRollout] = ActorRolloutRefWorker
-                    
-                actor_rollout_cls = self.role_worker_mapping[Role.ActorRollout]
+                # Get the resource pool for the ActorRollout role
+                actor_rollout_resource_pool = None
+                try:
+                    actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+                except Exception as e:
+                    print(f"Warning: Failed to get resource pool for ActorRollout: {str(e)}")
+                    # Find any available resource pool as fallback
+                    for pool in self.resource_pool_manager.resource_pool_dict.values():
+                        actor_rollout_resource_pool = pool
+                        print(f"Using fallback resource pool: {pool}")
+                        break
                 
-                # Check if resource_pool_manager is properly initialized
-                if not hasattr(self.resource_pool_manager, 'get_resource_pool'):
-                    print("Warning: resource_pool_manager does not have get_resource_pool method")
-                    raise AttributeError("resource_pool_manager is not properly initialized")
-                    
-                actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+                if actor_rollout_resource_pool is None:
+                    raise ValueError("No valid resource pool found for ActorRollout")
                 
-                is_gpu = actor_rollout_resource_pool.resource_selector.is_gpu()
-                num_gpus = actor_rollout_resource_pool.resource_selector.get_num_gpus()
+                # Check if GPU is available for this resource pool
+                is_gpu = False
+                num_gpus = 0
+                try:
+                    is_gpu = actor_rollout_resource_pool.resource_selector.is_gpu()
+                    num_gpus = actor_rollout_resource_pool.resource_selector.get_num_gpus()
+                except Exception as e:
+                    print(f"Warning: Failed to get GPU information from resource pool: {str(e)}")
                 
                 print(f"Worker colocated on CPUs: {not is_gpu}, num_gpus: {num_gpus}")
-            except Exception as e:
-                print(f"Error initializing actor-rollout worker: {str(e)}")
-                import traceback
-                print(traceback.format_exc())
-            
-            # Add Flash Attention configuration to actor_rollout
-            actor_rollout_config = self.config.actor_rollout_ref.copy()
-            
-            # Use open_dict to safely modify the config if needed
-            with open_dict(actor_rollout_config):
-                # Make sure model config exists
+                
+                # Add Flash Attention configuration to actor_rollout
+                actor_rollout_config = self.config.actor_rollout_ref.copy()
+                
+                # Ensure we have a model section
                 if not hasattr(actor_rollout_config, 'model'):
-                    actor_rollout_config.model = OmegaConf.create()
+                    with open_dict(actor_rollout_config):
+                        actor_rollout_config.model = OmegaConf.create()
                 
-                # Add the dtype and attention implementation to the model config
-                # These values are already string representations
-                actor_rollout_config.model.torch_dtype = self.rollout_config.training.torch_dtype
-                actor_rollout_config.model.attn_implementation = self.rollout_config.training.attn_implementation
-            
-            # Add to resource pool with proper key - use string key matching the role
-            self.resource_pool_to_cls[actor_rollout_resource_pool][Role.ActorRollout.name] = RayClassWithInitArgs(
-                self.role_worker_mapping[Role.ActorRollout],
-                kwargs=dict(
-                    config=actor_rollout_config,
-                    tokenizer=self.tokenizer,
-                    rollout_config=self.rollout_config,
-                    role=Role.ActorRollout.name
+                # Use the torch_dtype from rollout_config
+                with open_dict(actor_rollout_config):
+                    actor_rollout_config.model.torch_dtype = self.rollout_config.training.torch_dtype
+                    actor_rollout_config.model.attn_implementation = self.rollout_config.training.attn_implementation
+                
+                # Add to resource pool with proper key - use string key matching the role
+                self.resource_pool_to_cls[actor_rollout_resource_pool][Role.ActorRollout.name] = RayClassWithInitArgs(
+                    ActorRolloutRefWorker,  # Use the directly imported class
+                    kwargs=dict(
+                        config=actor_rollout_config,
+                        tokenizer=self.tokenizer,
+                        rollout_config=self.rollout_config,
+                        role=Role.ActorRollout.name
+                    )
                 )
-            )
-            
-            # If critic is needed, set it up similarly
-            if self.use_critic:
-                # Check if critic config exists
-                if not hasattr(self.config, 'critic'):
-                    print("[WARNING] Critic role is defined but config.critic is missing. Skipping critic initialization.")
-                    self.use_critic = False
-                else:
-                    resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-                    self.resource_pool_to_cls[resource_pool][Role.Critic.name] = RayClassWithInitArgs(
-                        self.role_worker_mapping[Role.Critic],
-                        kwargs=dict(
-                            config=self.config.critic,
-                            tokenizer=self.tokenizer,
-                            role=Role.Critic.name
-                        )
-                    )
                 
-            # Set up reference policy if needed
-            if self.use_reference_policy:
-                # Check if reference policy config exists
-                if not hasattr(self.config, 'ref'):
-                    print("[WARNING] RefPolicy role is defined but config.ref is missing. Skipping reference policy initialization.")
-                    self.use_reference_policy = False
-                else:
-                    resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
-                    self.resource_pool_to_cls[resource_pool][Role.RefPolicy.name] = RayClassWithInitArgs(
-                        self.role_worker_mapping[Role.RefPolicy],
-                        kwargs=dict(
-                            config=self.config.ref,
-                            tokenizer=self.tokenizer,
-                            role=Role.RefPolicy.name
-                        )
-                    )
+                print(f"Successfully added ActorRolloutRefWorker to resource pool")
                 
-            # Set up reward model if needed
-            if self.use_rm:
-                # Check if reward model config exists
-                if not hasattr(self.config, 'rm'):
-                    print("[WARNING] RewardModel role is defined but config.rm is missing. Skipping reward model initialization.")
-                    self.use_rm = False
-                else:
-                    resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-                    self.resource_pool_to_cls[resource_pool][Role.RewardModel.name] = RayClassWithInitArgs(
-                        self.role_worker_mapping[Role.RewardModel],
-                        kwargs=dict(
-                            config=self.config.rm,
-                            tokenizer=self.tokenizer,
-                            role=Role.RewardModel.name
-                        )
-                    )
-            
+            except Exception as e:
+                print(f"Error in hybrid_engine initialization: {str(e)}")
+                traceback.print_exc()
+                raise
         else:
             raise NotImplementedError
 
@@ -750,7 +689,6 @@ class RayPPOTrainer(object):
         # The issue is that the worker methods aren't properly exposed through Ray
         # This modification explicitly forwards important methods to the actual worker instance
         if hasattr(self, 'actor_rollout_wg') and hasattr(self.actor_rollout_wg, '_workers') and len(self.actor_rollout_wg._workers) > 0:
-            import ray
             import types
             
             # Define a method to generate a wrapper function that calls the remote worker's method
