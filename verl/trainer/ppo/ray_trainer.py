@@ -16,37 +16,38 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
-import os
-import uuid
-import ray
+import json
 import logging
+import os
+import time
+import re
 import traceback
-from contextlib import contextmanager
+import uuid
+from typing import Dict, List, Tuple, Type
 from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
-from typing import Type, Dict
-
-import re
-import json
-from collections import defaultdict
 
 import numpy as np
 import torch
+import ray
 from codetiming import Timer
-from omegaconf import OmegaConf, open_dict
-from verl import DataProto
+from omegaconf import OmegaConf, open_dict, read_write
+
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.base import Worker
-from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
+from verl.single_controller.ray.base import RayWorkerGroup, RayResourcePool, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
-from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker, RewardModelWorker
+from verl.workers.fsdp_workers import CriticWorker, ActorRolloutRefWorker, RewardModelWorker
 from verl.utils.torch_functional import masked_mean
-
-import re
 from ragen.llm_agent.generation import LLMGenerationManager, GenerationConfig
+
+try:
+    from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+except ImportError:
+    from verl.utils.dataset import RLHFDataset, collate_fn
 
 WorkerType = Type[Worker]
 
@@ -90,7 +91,7 @@ class ResourcePoolManager:
         return self.resource_pool_dict[self.mapping[role]]
 
 
-def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
+def apply_kl_penalty(data, kl_ctrl, kl_penalty='kl'):
     responses = data.batch['responses']
     response_length = responses.size(1)
     token_level_scores = data.batch['token_level_scores']
@@ -122,7 +123,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+def compute_advantage(data, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
     # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == 'gae':
@@ -163,19 +164,32 @@ def reduce_metrics(metrics: dict):
 
 
 def _compute_response_info(batch):
-    response_length = batch.batch['responses'].shape[-1]
-
-    prompt_mask = batch.batch['attention_mask'][:, :-response_length]
-    response_mask = batch.batch['attention_mask'][:, -response_length:]
-
-    prompt_length = prompt_mask.sum(-1).float()
-    response_length = response_mask.sum(-1).float()  # (batch_size,)
-
-    return dict(
-        response_mask=response_mask,
-        prompt_length=prompt_length,
-        response_length=response_length,
-    )
+    """Compute response statistics."""
+    metrics = {}
+    # If batch is not a list, make it a list for consistent processing
+    if not isinstance(batch, list):
+        batch = [batch]
+        
+    token_counts = []
+    for item in batch:
+        if isinstance(item, dict) and 'response' in item:
+            # Count non-padding tokens in the response
+            response = item['response']
+            if isinstance(response, torch.Tensor):
+                # Count non-zero tokens (assuming padding is 0)
+                token_count = torch.sum(response != 0).item()
+            elif isinstance(response, list):
+                token_count = len(response)
+            else:
+                token_count = 0
+            token_counts.append(token_count)
+    
+    if token_counts:
+        metrics['response_token_count/mean'] = sum(token_counts) / len(token_counts)
+        metrics['response_token_count/min'] = min(token_counts)
+        metrics['response_token_count/max'] = max(token_counts)
+    
+    return metrics
 
 
 def compute_data_metrics(batch, use_critic=True):
@@ -393,55 +407,82 @@ class RayPPOTrainer(object):
                           config=OmegaConf.to_container(self.config, resolve=True))
 
     def _create_dataloader(self):
-        from torch.utils.data import DataLoader
-        # TODO: we have to make sure the batch size is divisible by the dp size
-        from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
-        self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
-                                         tokenizer=self.tokenizer,
-                                         prompt_key=self.config.data.prompt_key,
-                                         max_prompt_length=self.config.data.max_prompt_length,
-                                         filter_prompts=True,
-                                         return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                         truncation='error')
-        if self.config.data.get('train_data_num') is not None:
-            if self.config.data.train_data_num > len(self.train_dataset.dataframe):
-                print(f"[WARNING] training dataset size is smaller than desired size. Using the dataset as the original size {len(self.train_dataset.dataframe)}")
-            else:
-                self.train_dataset.dataframe = self.train_dataset.dataframe.sample(self.config.data.train_data_num, random_state=42)
-        print(f"filtered training dataset size: {len(self.train_dataset.dataframe)}")
-
-        self.train_dataloader = DataLoader(dataset=self.train_dataset,
-                                           batch_size=self.config.data.train_batch_size,
-                                           shuffle=self.config.data.shuffle_train_dataloader,
-                                           drop_last=True,
-                                           collate_fn=collate_fn)
-
-        self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
-                                       tokenizer=self.tokenizer,
-                                       prompt_key=self.config.data.prompt_key,
-                                       max_prompt_length=self.config.data.max_prompt_length,
-                                       filter_prompts=True,
-                                       return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                       truncation='error')
-        if self.config.data.get('val_data_num') is not None:
-            if self.config.data.val_data_num > len(self.val_dataset.dataframe):
-                print(f"[WARNING] validation dataset size is smaller than desired size. Using the dataset as the original size {len(self.val_dataset.dataframe)}")
-            else:
-                self.val_dataset.dataframe = self.val_dataset.dataframe.sample(self.config.data.val_data_num, random_state=42)
-        print(f"filtered validation dataset size: {len(self.val_dataset.dataframe)}")
-
-        self.val_dataloader = DataLoader(dataset=self.val_dataset,
-                                         batch_size=self.config.data.val_batch_size,
-                                         shuffle=True,
-                                         drop_last=True,
-                                         collate_fn=collate_fn)
-
-        print(f'Size of train dataloader: {len(self.train_dataloader)}')
-        print(f'Size of val dataloader: {len(self.val_dataloader)}')
+        """Create train dataloader and validation dataloader."""
         
-        assert len(self.train_dataloader) >= 1
-        assert len(self.val_dataloader) >= 1
-
+        # Initialize dataloaders for training and validation
+        train_config = OmegaConf.to_container(self.config.data, resolve=True)
+        
+        # Convert to proper Python types
+        for k, v in train_config.items():
+            if isinstance(v, str) and v.lower() == 'none':
+                train_config[k] = None
+        
+        val_config = train_config.copy()
+        
+        # Update validation config with specific values
+        val_config.update({
+            'batch_size': self.config.data.val_batch_size,
+            'data_files': self.config.data.val_files,
+            'data_num': self.config.data.val_data_num,
+        })
+        
+        train_config.update({
+            'batch_size': self.config.data.train_batch_size,
+            'data_files': self.config.data.train_files, 
+            'data_num': self.config.data.train_data_num,
+            'shuffle': self.config.data.shuffle_train_dataloader
+        })
+        
+        # Use PyArrow to read parquet files
+        import pyarrow.parquet as pq
+        
+        original_train_dataset = pq.read_table(train_config['data_files']).to_pandas()
+        original_val_dataset = pq.read_table(val_config['data_files']).to_pandas()
+        
+        print(f"original dataset len: {len(original_train_dataset)}")
+        
+        # Filter dataset if needed
+        if train_config.get('data_num') is not None:
+            train_dataset = original_train_dataset.head(train_config['data_num'])
+        else:
+            train_dataset = original_train_dataset
+            
+        print(f"filter dataset len: {len(train_dataset)}")
+        print(f"filtered training dataset size: {len(train_dataset)}")
+        
+        # Filter validation dataset
+        print(f"original dataset len: {len(original_val_dataset)}")
+        if val_config.get('data_num') is not None:
+            val_dataset = original_val_dataset.head(val_config['data_num'])
+        else:
+            val_dataset = original_val_dataset
+            
+        print(f"filter dataset len: {len(val_dataset)}")
+        print(f"filtered validation dataset size: {len(val_dataset)}")
+        
+        # Create dataloaders
+        self.train_dataloader = torch.utils.data.DataLoader(
+            train_dataset, 
+            batch_size=train_config['batch_size'],
+            shuffle=train_config.get('shuffle', True)
+        )
+        
+        self.val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=val_config['batch_size'],
+            shuffle=False
+        )
+        
+        print(f"Size of train dataloader: {len(self.train_dataloader)}")
+        print(f"Size of val dataloader: {len(self.val_dataloader)}")
+        
+        # Calculate total training steps
+        self.total_training_steps = self.config.trainer.total_training_steps
+        if self.total_training_steps is None:
+            self.total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        
+        print(f"Total training steps: {self.total_training_steps}")
+        
         # inject total_training_steps to actor/critic optim_config. This is hacky.
         total_training_steps = len(self.train_dataloader) * self.config.trainer.get('total_epochs', 1)
 
@@ -460,7 +501,50 @@ class RayPPOTrainer(object):
         """Initialize all Ray workers needed for PPO training."""
         # Init resource pool
         print("Initialize workers...")
-        self.resource_pool_manager.create_resource_pool()
+        
+        # Add missing default roles to config if needed
+        if not hasattr(self.config.actor_rollout_ref, 'roles'):
+            print("Warning: roles not defined in actor_rollout_ref, setting default roles [actor, rollout]")
+            with open_dict(self.config.actor_rollout_ref):
+                self.config.actor_rollout_ref.roles = [Role.Actor.name.lower(), Role.Rollout.name.lower()]
+        
+        # Create a proper RayResourcePool instance
+        resource_pool = RayResourcePool(
+            process_on_nodes=[0],  # Use the current node
+            use_gpu=True,
+            name_prefix="worker_pool",
+            detached=False
+        )
+        
+        # Initialize resource_pool_to_cls dictionary
+        self.resource_pool_to_cls = {}
+        self.resource_pool_to_cls[resource_pool] = {}
+        
+        # Register worker classes with proper ray.remote wrapping
+        print("Registering ActorRolloutRefWorker")
+        ActorRolloutRefWorkerRemote = ray.remote(ActorRolloutRefWorker)
+        self.resource_pool_to_cls[resource_pool][Role.ActorRollout.name] = RayClassWithInitArgs(
+            ActorRolloutRefWorkerRemote,
+            kwargs=dict(
+                config=self.config.actor_rollout_ref,
+                tokenizer=self.tokenizer,
+                rollout_config=self.rollout_config
+            )
+        )
+        
+        if self.use_critic:
+            print("Registering CriticWorker")
+            CriticWorkerRemote = ray.remote(CriticWorker)
+            self.resource_pool_to_cls[resource_pool][Role.Critic.name] = RayClassWithInitArgs(
+                CriticWorkerRemote,
+                kwargs=dict(
+                    config=self.config.critic,
+                    tokenizer=self.tokenizer
+                )
+            )
+        
+        # Create worker groups
+        self.wg_dicts = []
         
         config = OmegaConf.to_container(self.config, resolve=True)
 
@@ -636,33 +720,20 @@ class RayPPOTrainer(object):
                     actor_rollout_config.model.torch_dtype = self.rollout_config.training.torch_dtype
                     actor_rollout_config.model.attn_implementation = self.rollout_config.training.attn_implementation
                 
-                # Create the colocated worker class
-                colocated_worker_cls = create_colocated_worker_cls({
-                    Role.ActorRollout.name: RayClassWithInitArgs(
-                        ActorRolloutRefWorker,
-                        kwargs=dict(
-                            config=actor_rollout_config,
-                            tokenizer=self.tokenizer,
-                            rollout_config=self.rollout_config,
-                            role=Role.ActorRollout.name
-                        )
-                    )
-                })
+                # Create a single worker group for the actor_rollout worker
+                actor_rollout_worker = self.resource_pool_to_cls[resource_pool][Role.ActorRollout.name]
                 
-                # Create a worker group with the colocated worker class
-                print("Creating worker group with colocated worker class")
+                print(f"Creating worker group for ActorRolloutRefWorker")
                 worker_group = self.ray_worker_group_cls(
                     resource_pool=resource_pool,
-                    ray_cls_with_init=colocated_worker_cls,
+                    ray_cls_with_init=actor_rollout_worker,
                     bin_pack=True,
-                    name_prefix="colocated_workers",
+                    name_prefix="actor_rollout_workers",
                     detached=False
                 )
                 
-                # Add this worker group to our list
+                # Add this worker group to our list and create a shortcut
                 self.wg_dicts.append(worker_group)
-                
-                # Create worker shortcuts
                 self.actor_rollout_wg = worker_group
                 print("Successfully created actor_rollout_wg")
                 
@@ -838,17 +909,23 @@ class RayPPOTrainer(object):
                 metrics = {}
                 timing_raw = {}
 
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
-                batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
+                batch = {}
+                batch['input_ids'] = batch_dict['input_ids']
+                batch['attention_mask'] = batch_dict['attention_mask']
+                batch['position_ids'] = batch_dict['position_ids']
+                batch['extra_info'] = batch_dict['extra_info']
+                batch['data_source'] = batch_dict['data_source']
 
-                env_seeds = [i['index'] for i in batch.non_tensor_batch['extra_info']]
+                env_seeds = [i['index'] for i in batch['extra_info']]
                 print("env_seeds:", env_seeds)
                 for env, seed in zip(envs, env_seeds):
                     env.reset(seed=seed)
 
 
                 # pop those keys for generation
-                gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+                gen_batch = batch.copy()
+                gen_batch.pop('extra_info')
+                gen_batch.pop('data_source')
 
                 ####################
                 # original code here
@@ -879,7 +956,7 @@ class RayPPOTrainer(object):
                     Errors swarm? Stay calm, don't fret- Code with coffee, debug sunset.
                     """
 
-                    first_input_ids = gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
+                    first_input_ids = gen_batch['input_ids'][:, -gen_config.max_start_length:].clone()
                     output_dir = (f"{self.config.logging.log_image_dir}/"
                                  f"{self.config.trainer.experiment_name}/"
                                  f"train/"
@@ -900,39 +977,39 @@ class RayPPOTrainer(object):
                         final_gen_batch_output = final_gen_batch_output.union(output)
                     
                     if self.config.algorithm.get('adv_estimator') == 'grpo': # NOTE we currently use seed to group, better use prompt (hash) to group
-                        batch.non_tensor_batch['uid'] = np.array([str(i) for i in env_seeds], dtype=object)
+                        batch['uid'] = np.array([str(i) for i in env_seeds], dtype=object)
                     elif self.config.algorithm.get('adv_estimator') == 'brpo':
-                        batch.non_tensor_batch['uid'] = np.array(["" for _ in range(len(batch.batch))], dtype=object)
+                        batch['uid'] = np.array(["" for _ in range(len(batch['input_ids']))], dtype=object)
                     elif self.config.algorithm.get('adv_estimator') == 'arpo':
-                        batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object) # No Relative normalization
+                        batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch['input_ids']))], dtype=object) # No Relative normalization
 
                     # reward
-                    batch.non_tensor_batch['reward'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                    batch['reward'] = np.array([0 for _ in range(len(envs))], dtype=object)
                     for idx, env in enumerate(envs):
-                        batch.non_tensor_batch['reward'][idx] = env.reward
+                        batch['reward'][idx] = env.reward
 
                     # metric for two-armed bandit
                     # NOTE here we assume invalid action is 0, low arm is 1, high arm is 2
-                    if batch.non_tensor_batch['data_source'][0] == 'two_armed_bandit':
-                        batch.non_tensor_batch['bandit_metrics'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                    if batch['data_source'][0] == 'two_armed_bandit':
+                        batch['bandit_metrics'] = np.array([0 for _ in range(len(envs))], dtype=object)
                         for idx, env in enumerate(envs):
-                            batch.non_tensor_batch['bandit_metrics'][idx] = env.get_last_action()
+                            batch['bandit_metrics'][idx] = env.get_last_action()
                     # metrics for actions
-                    batch.non_tensor_batch['total_env'] = np.array([1 for _ in range(len(envs))], dtype=object)
-                    batch.non_tensor_batch['finished_env'] = np.array([0 for _ in range(len(envs))], dtype=object)
-                    batch.non_tensor_batch['success_env'] = np.array([0 for _ in range(len(envs))], dtype=object)
-                    batch.non_tensor_batch['traj_length'] = np.array([0 for _ in range(len(envs))], dtype=object)
-                    batch.non_tensor_batch['valid_action'] = np.array([0 for _ in range(len(envs))], dtype=object)
-                    batch.non_tensor_batch['effective_action'] = np.array([0 for _ in range(len(envs))], dtype=object)
-                    batch.non_tensor_batch['effective_action_ratio'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                    batch['total_env'] = np.array([1 for _ in range(len(envs))], dtype=object)
+                    batch['finished_env'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                    batch['success_env'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                    batch['traj_length'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                    batch['valid_action'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                    batch['effective_action'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                    batch['effective_action_ratio'] = np.array([0 for _ in range(len(envs))], dtype=object)
                     for idx, env in enumerate(envs):
-                        batch.non_tensor_batch['finished_env'][idx] = int(env.finished())
-                        batch.non_tensor_batch['success_env'][idx] = int(env.success())
+                        batch['finished_env'][idx] = int(env.finished())
+                        batch['success_env'][idx] = int(env.success())
                         tracking_vars = env.get_tracking_variables()
-                        batch.non_tensor_batch['traj_length'][idx] = len(tracking_vars['actions'])
-                        batch.non_tensor_batch['valid_action'][idx] = sum(1 for x in tracking_vars['actions_valid'] if x is not None)
-                        batch.non_tensor_batch['effective_action'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None)
-                        batch.non_tensor_batch['effective_action_ratio'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None) / len(tracking_vars['actions'])
+                        batch['traj_length'][idx] = len(tracking_vars['actions'])
+                        batch['valid_action'][idx] = sum(1 for x in tracking_vars['actions_valid'] if x is not None)
+                        batch['effective_action'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None)
+                        batch['effective_action_ratio'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None) / len(tracking_vars['actions'])
 
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(final_gen_batch_output)
@@ -947,7 +1024,7 @@ class RayPPOTrainer(object):
                     self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
-                    batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
+                    batch['global_token_num'] = torch.sum(batch['attention_mask'], dim=-1).tolist()
 
                     if self.use_reference_policy:
                         # compute reference log_prob
@@ -972,7 +1049,7 @@ class RayPPOTrainer(object):
 
                         # we combine with rule-based rm
                         reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
+                        batch['token_level_scores'] = reward_tensor
 
                         # compute rewards. apply_kl_penalty if available, no kl_loss or kl_penalty for GAE
                         if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False) or self.config.algorithm.get('adv_estimator') != 'gae':
@@ -981,7 +1058,7 @@ class RayPPOTrainer(object):
                                                                  kl_penalty=self.config.algorithm.get('kl_penalty', 'kl'))
                             metrics.update(kl_metrics)
                         else:
-                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+                            batch['token_level_rewards'] = batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(batch,
@@ -994,7 +1071,7 @@ class RayPPOTrainer(object):
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
                             critic_output = self.actor_rollout_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                        critic_output_metrics = reduce_metrics(critic_output['metrics'])
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
@@ -1004,7 +1081,7 @@ class RayPPOTrainer(object):
                             if self.config.actor_rollout_ref.actor.get('state_masking', False):
                                 batch,metrics = self._create_loss_mask(batch, metrics)
                             actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                        actor_output_metrics = reduce_metrics(actor_output['metrics'])
                         metrics.update(actor_output_metrics)
 
                     # validate
@@ -1042,13 +1119,13 @@ class RayPPOTrainer(object):
         The mask has 1s for action tokens (include in loss calculation) and 0s for observation tokens 
         (exclude from loss calculation).
         """
-        response_length = batch.batch['responses'].shape[-1]
-        response_mask = batch.batch['attention_mask'][:, -response_length:]
+        response_length = batch['responses'].shape[-1]
+        response_mask = batch['attention_mask'][:, -response_length:]
 
         # Initialize action mask (all tokens initially considered as actions)
         action_mask = torch.ones_like(response_mask)
         
-        responses = [self.tokenizer.decode(resp, skip_special_tokens=False) for resp in batch.batch['responses']]
+        responses = [self.tokenizer.decode(resp, skip_special_tokens=False) for resp in batch['responses']]
 
         for i, response in enumerate(responses):
             # Find all pairs of start and end marker positions
@@ -1076,11 +1153,11 @@ class RayPPOTrainer(object):
         
         # Apply response mask to ensure we only consider valid tokens
         loss_mask = action_mask * response_mask
-        batch.batch['loss_mask'] = loss_mask
+        batch['loss_mask'] = loss_mask
         
         # Debug print
-        print("\nRaw batch[0] (before masking):\n", self.tokenizer.decode(batch.batch['responses'][0]))
-        response_ids = batch.batch['responses'][0]
+        print("\nRaw batch[0] (before masking):\n", self.tokenizer.decode(batch['responses'][0]))
+        response_ids = batch['responses'][0]
         
         # Now unmasked IDs are action tokens (loss_mask = 1)
         unmasked_ids = response_ids[loss_mask[0] == 1]
@@ -1140,16 +1217,22 @@ class RayPPOTrainer(object):
 
         for batch_dict in self.val_dataloader:
             timing_raw = {}
-            test_batch: DataProto = DataProto.from_single_dict(batch_dict)
-            test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
+            test_batch = {}
+            test_batch['input_ids'] = batch_dict['input_ids']
+            test_batch['attention_mask'] = batch_dict['attention_mask']
+            test_batch['position_ids'] = batch_dict['position_ids']
+            test_batch['extra_info'] = batch_dict['extra_info']
+            test_batch['data_source'] = batch_dict['data_source']
 
-            env_seeds = [i['index'] for i in test_batch.non_tensor_batch['extra_info']]
+            env_seeds = [i['index'] for i in test_batch['extra_info']]
             print("env_seeds:", env_seeds)
             for env, seed in zip(envs, env_seeds):
                 env.reset(seed=seed)
             
-            test_gen_batch = test_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
-            test_gen_batch.meta_info = {
+            test_gen_batch = test_batch.copy()
+            test_gen_batch.pop('extra_info')
+            test_gen_batch.pop('data_source')
+            test_gen_batch['meta_info'] = {
                 'eos_token_id': self.tokenizer.eos_token_id,
                 'pad_token_id': self.tokenizer.pad_token_id,
                 'recompute_log_prob': False,
@@ -1157,7 +1240,7 @@ class RayPPOTrainer(object):
                 'validate': True,
             }
             with _timer('step', timing_raw):
-                first_input_ids = test_gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
+                first_input_ids = test_gen_batch['input_ids'][:, -gen_config.max_start_length:].clone()
                 output_dir = (f"{self.config.logging.log_image_dir}/"
                                 f"{self.config.trainer.experiment_name}/"
                                 f"validation_{self.val_num}/"
@@ -1175,36 +1258,36 @@ class RayPPOTrainer(object):
                     output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
                     final_gen_batch_output = final_gen_batch_output.union(output)
 
-                test_batch.non_tensor_batch['reward'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                test_batch['reward'] = np.array([0 for _ in range(len(envs))], dtype=object)
                 for idx, env in enumerate(envs):
-                    test_batch.non_tensor_batch['reward'][idx] = env.reward
+                    test_batch['reward'][idx] = env.reward
 
-                if test_batch.non_tensor_batch['data_source'][0] == 'two_armed_bandit':
+                if test_batch['data_source'][0] == 'two_armed_bandit':
                     # metric for two-armed bandit
                     # NOTE here we assume invalid action is 0, low arm is 1, high arm is 2
-                    test_batch.non_tensor_batch['bandit_metrics'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                    test_batch['bandit_metrics'] = np.array([0 for _ in range(len(envs))], dtype=object)
                     for idx, env in enumerate(envs):
-                        test_batch.non_tensor_batch['bandit_metrics'][idx] = env.get_last_action()
-                metrics['bandit_metrics'].append(test_batch.non_tensor_batch['bandit_metrics'])
+                        test_batch['bandit_metrics'][idx] = env.get_last_action()
+                metrics['bandit_metrics'].append(test_batch['bandit_metrics'])
                 
-                test_batch.non_tensor_batch['total_env'] = np.array([1 for _ in range(len(envs))], dtype=object)
-                test_batch.non_tensor_batch['finished_env'] = np.array([0 for _ in range(len(envs))], dtype=object)
-                test_batch.non_tensor_batch['success_env'] = np.array([0 for _ in range(len(envs))], dtype=object)
-                test_batch.non_tensor_batch['traj_length'] = np.array([0 for _ in range(len(envs))], dtype=object)
-                test_batch.non_tensor_batch['valid_action'] = np.array([0 for _ in range(len(envs))], dtype=object)
-                test_batch.non_tensor_batch['effective_action'] = np.array([0 for _ in range(len(envs))], dtype=object)
-                test_batch.non_tensor_batch['effective_action_ratio'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                test_batch['total_env'] = np.array([1 for _ in range(len(envs))], dtype=object)
+                test_batch['finished_env'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                test_batch['success_env'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                test_batch['traj_length'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                test_batch['valid_action'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                test_batch['effective_action'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                test_batch['effective_action_ratio'] = np.array([0 for _ in range(len(envs))], dtype=object)
                 for idx, env in enumerate(envs):
-                    test_batch.non_tensor_batch['finished_env'][idx] = int(env.finished())
-                    test_batch.non_tensor_batch['success_env'][idx] = int(env.success())
+                    test_batch['finished_env'][idx] = int(env.finished())
+                    test_batch['success_env'][idx] = int(env.success())
                     tracking_vars = env.get_tracking_variables()
-                    test_batch.non_tensor_batch['traj_length'][idx] = len(tracking_vars['actions'])
-                    test_batch.non_tensor_batch['valid_action'][idx] = sum(1 for x in tracking_vars['actions_valid'] if x is not None)
-                    test_batch.non_tensor_batch['effective_action'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None)
-                    test_batch.non_tensor_batch['effective_action_ratio'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None) / len(tracking_vars['actions'])
+                    test_batch['traj_length'][idx] = len(tracking_vars['actions'])
+                    test_batch['valid_action'][idx] = sum(1 for x in tracking_vars['actions_valid'] if x is not None)
+                    test_batch['effective_action'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None)
+                    test_batch['effective_action_ratio'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None) / len(tracking_vars['actions'])
 
                 # Accumulate batch metrics into global storage
-                global_token_scores.append(test_batch.non_tensor_batch['reward'])
+                global_token_scores.append(test_batch['reward'])
 
         global_scores = np.concatenate(global_token_scores, axis=0)
         global_metrics = {
@@ -1228,7 +1311,7 @@ class RayPPOTrainer(object):
         print("global_metrics", global_metrics)
         return global_metrics
 
-    def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
+    def _balance_batch(self, batch, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         resp_info = _compute_response_info(batch)
         
@@ -1261,9 +1344,9 @@ class RayPPOTrainer(object):
             batch = batch.reindex(reorder_idxs)
         
         # Ensure loss mask is in the correct precision
-        if 'loss_mask' in batch.batch:
-            device = batch.batch['responses'].device
-            dtype = batch.batch['responses'].dtype
-            batch.batch['loss_mask'] = batch.batch['loss_mask'].to(device=device, dtype=dtype)
+        if 'loss_mask' in batch:
+            device = batch['responses'].device
+            dtype = batch['responses'].dtype
+            batch['loss_mask'] = batch['loss_mask'].to(device=device, dtype=dtype)
             
         return batch, metrics
