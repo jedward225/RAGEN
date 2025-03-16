@@ -25,12 +25,15 @@ from ray import tune
 from ray.runtime_context import get_runtime_context
 from ray.experimental.state.api import get_actor
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy, NodeAffinitySchedulingStrategy
-from verl.single_controller.base.worker_group import ResourcePool, ClassWithInitArgs, WorkerGroup
-from verl.single_controller.base.decorator import Dispatch, MAGIC_ATTR
 from unittest.mock import patch
-from verl.single_controller.base.decorator import dispatch_one_to_all, dispatch_all_to_all, collect_all_to_all
+
+# First import base classes 
+from verl.single_controller.base.worker_group import ResourcePool, ClassWithInitArgs, WorkerGroup
+from verl.single_controller.base.worker import Worker
+from verl.single_controller.base.decorator import Dispatch, MAGIC_ATTR, dispatch_one_to_all, dispatch_all_to_all, collect_all_to_all
 
 __all__ = ['Worker', 'RayResourcePool', 'RayClassWithInitArgs', 'RayWorkerGroup', 'create_colocated_worker_cls']
+
 
 def _default_generate_function(worker_group, method_name, dispatch_mode):
     """Default function generator for worker methods"""
@@ -63,19 +66,12 @@ def _default_generate_function(worker_group, method_name, dispatch_mode):
         def collect_fn(output):
             return collect_all_to_all(worker_group, output)
 
-    # Use func_generator to create the function
-    return func_generator(worker_group, method_name, dispatch_fn, collect_fn, execute_fn, True)
-
-
-def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
-    """Generate a function that dispatches and executes a remote task."""
-
     def func(*args, **kwargs):
-        args, kwargs = dispatch_fn(self, *args, **kwargs)
+        args, kwargs = dispatch_fn(worker_group, *args, **kwargs) 
         output = execute_fn(method_name, *args, **kwargs)
-        if blocking:
+        if isinstance(output, ray.ObjectRef) or isinstance(output, list) and all(isinstance(o, ray.ObjectRef) for o in output):
             output = ray.get(output)
-        return collect_fn(output)  # Pass output directly to collect_fn
+        return collect_fn(output)
 
     return func
 
@@ -251,7 +247,7 @@ class RayWorkerGroup(WorkerGroup):
                                           detached=detached)
 
         if ray_cls_with_init is not None:
-            self._bind_worker_method(self.ray_cls_with_init.cls, func_generator)
+            self._bind_worker_method(self.ray_cls_with_init.cls, None)
 
     def _is_worker_alive(self, worker: ray.actor.ActorHandle):
         worker_state_dict = get_actor(worker._actor_id.hex())
@@ -475,11 +471,9 @@ class RayWorkerGroup(WorkerGroup):
             if hasattr(method, MAGIC_ATTR):
                 dispatch_mode = getattr(method, MAGIC_ATTR)
 
-                if func_generator is None:
-                    # use default generator
-                    func_generator = _default_generate_function
-                # bind function
-                func = func_generator(self, method_name, dispatch_mode)
+                # Always use _default_generate_function
+                func = _default_generate_function(self, method_name, dispatch_mode)
+                
                 # pass MAGIC_ATTR for outer worker group
                 setattr(func, MAGIC_ATTR, dispatch_mode)
                 setattr(self.__class__, method_name, func)
