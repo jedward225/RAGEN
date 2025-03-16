@@ -470,11 +470,13 @@ class RayPPOTrainer(object):
             self.rollout_config.training.pad_token = self.tokenizer.pad_token_id
             self.rollout_config.training.min_length = self.config.data.min_response_length if hasattr(self.config.data, 'min_response_length') else 0
             self.rollout_config.training.max_length = self.config.data.max_response_length
-            self.rollout_config.training.temperature = self.config.training.temperature
+            # Access temperature directly from the config rather than config.training
+            self.rollout_config.training.temperature = self.config.optimization.temperature if hasattr(self.config.optimization, 'temperature') else 0.7
             self.rollout_config.training.num_return_sequences = 1
             self.rollout_config.training.max_obs_length = self.config.data.max_obs_length
-            self.rollout_config.training.binary_reward = self.config.training.binary_reward
-            self.rollout_config.training.length_penalty = self.config.training.length_penalty
+            # Access binary_reward and length_penalty directly from the config
+            self.rollout_config.training.binary_reward = self.config.algorithm.binary_reward if hasattr(self.config.algorithm, 'binary_reward') else False
+            self.rollout_config.training.length_penalty = self.config.algorithm.length_penalty if hasattr(self.config.algorithm, 'length_penalty') else False
             
             # Add precision settings for Flash Attention compatibility
             self.rollout_config.training.torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -1050,7 +1052,7 @@ class RayPPOTrainer(object):
                     test_batch.non_tensor_batch['bandit_metrics'] = np.array([0 for _ in range(len(envs))], dtype=object)
                     for idx, env in enumerate(envs):
                         test_batch.non_tensor_batch['bandit_metrics'][idx] = env.get_last_action()
-                    metrics['bandit_metrics'].append(test_batch.non_tensor_batch['bandit_metrics'])
+                metrics['bandit_metrics'].append(test_batch.non_tensor_batch['bandit_metrics'])
                 
                 test_batch.non_tensor_batch['total_env'] = np.array([1 for _ in range(len(envs))], dtype=object)
                 test_batch.non_tensor_batch['finished_env'] = np.array([0 for _ in range(len(envs))], dtype=object)
