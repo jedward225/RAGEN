@@ -456,9 +456,61 @@ class RayPPOTrainer(object):
             self.config.critic.optim.total_training_steps = total_training_steps
 
     def init_workers(self):
-        """Init resource pool and worker group"""
-        # init resource pool
+        """Initialize all Ray workers needed for PPO training."""
+        # Init resource pool
+        self.logger.info("Initialize workers...")
         self.resource_pool_manager.create_resource_pool()
+        
+        config = OmegaConf.to_container(self.config, resolve=True)
+
+        # Create the actor, rollout and ref workers
+        has_rollout_role = 'rollout' in config['actor_rollout_ref']['roles']
+        has_actor_role = 'actor' in config['actor_rollout_ref']['roles']
+        has_ref_role = 'ref' in config['actor_rollout_ref']['roles']
+
+        # Initialize worker arguments
+        worker_kwargs = {}
+        
+        # Check for required config sections
+        has_ref_config = 'ref' in config
+        if has_ref_role and not has_ref_config:
+            self.logger.warning("RefPolicy role is defined but config.ref is missing. Skipping reference policy initialization.")
+            has_ref_role = False
+            
+        # Safely access config sections using get() to avoid KeyError
+        ref_config = config.get('ref', {}) if has_ref_config else {}
+        rm_config = config.get('rm', {}) if 'rm' in config else {}
+        critic_config = config.get('critic', {}) if 'critic' in config else {}
+        
+        # Only add configs that exist
+        actor_rollout_ref_kwargs = {'args': (), 'kwargs': {'config': config}}
+        worker_kwargs['actor_rollout_ref'] = actor_rollout_ref_kwargs
+
+        # Only initialize critic if config exists
+        if 'critic' in config:
+            critic_kwargs = {'args': (), 'kwargs': {'config': critic_config}}
+            worker_kwargs['critic'] = critic_kwargs
+
+        # Only initialize reward model if config exists
+        if 'rm' in config:
+            rm_kwargs = {'args': (), 'kwargs': {'config': rm_config}}
+            worker_kwargs['rm'] = rm_kwargs
+
+        # Initialize class dictionary with implementation details
+        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+        
+        ray_classes = {}
+        ray_classes['actor_rollout_ref'] = ray.remote(ActorRolloutRefWorker)
+        
+        if 'critic' in config:
+            ray_classes['critic'] = ray.remote(CriticWorker)
+        
+        if 'rm' in config:
+            ray_classes['rm'] = ray.remote(RewardModelWorker)
+
+        worker_group = self.ray_worker_group_cls(
+            ray_classes, worker_kwargs, preemptible_node_type="gpu_p4",
+            min_replicas=1, max_replicas=1, detached=False)
         
         # Initialize class dictionary with most implementation details
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}

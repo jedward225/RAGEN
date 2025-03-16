@@ -623,14 +623,47 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
     class WorkerDict(worker_cls):
 
         def __init__(self):
+            # Set up environment variables that Worker class expects
+            import os
+            if 'WORLD_SIZE' not in os.environ:
+                os.environ['WORLD_SIZE'] = '1'
+            if 'RANK' not in os.environ:
+                os.environ['RANK'] = '0'
+            if 'MASTER_ADDR' not in os.environ:
+                os.environ['MASTER_ADDR'] = 'localhost'
+            if 'MASTER_PORT' not in os.environ:
+                os.environ['MASTER_PORT'] = '29500'
+            if 'LOCAL_WORLD_SIZE' not in os.environ:
+                os.environ['LOCAL_WORLD_SIZE'] = '1'
+            if 'LOCAL_RANK' not in os.environ:
+                os.environ['LOCAL_RANK'] = '0'
+                
+            # Now initialize the Worker base class
             super().__init__()
+            
+            # Initialize important Worker attributes that might be missing
+            self._rank = int(os.environ.get('RANK', 0))  # Default rank
+            self._world_size = int(os.environ.get('WORLD_SIZE', 1))  # Default world size
+            
             self.worker_dict = {}
             for key, user_defined_cls in cls_dict.items():
                 user_defined_cls = _unwrap_ray_remote(user_defined_cls)
+                
+                # Check if we have initialization arguments
+                if key not in init_args_dict:
+                    print(f"Warning: No initialization arguments found for worker type '{key}'")
+                    init_args_dict[key] = {'args': (), 'kwargs': {}}
+                
                 # directly instantiate the class without remote
                 with patch.dict(os.environ, {'DISABLE_WORKER_INIT': '1'}):
-                    self.worker_dict[key] = user_defined_cls(*init_args_dict[key].get('args', ()),
-                                                             **init_args_dict[key].get('kwargs', {}))
+                    try:
+                        self.worker_dict[key] = user_defined_cls(*init_args_dict[key].get('args', ()),
+                                                              **init_args_dict[key].get('kwargs', {}))
+                    except Exception as e:
+                        print(f"Error initializing worker type '{key}': {str(e)}")
+                        import traceback
+                        print(traceback.format_exc())
+                        raise
 
     # now monkey-patch the methods from inner class to WorkerDict
     for key, user_defined_cls in cls_dict.items():
