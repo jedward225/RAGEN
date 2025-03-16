@@ -506,8 +506,15 @@ class RayPPOTrainer(object):
             self.rollout_config.training.length_penalty = length_penalty_value
             
             # Add precision settings for Flash Attention compatibility
-            self.rollout_config.training.torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            self.rollout_config.training.attn_implementation = "flash_attention_2"
+            # First check if CUDA is available
+            if torch.cuda.is_available():
+                self.rollout_config.training.torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                self.rollout_config.training.attn_implementation = "flash_attention_2"
+            else:
+                # If CUDA is not available, use CPU-compatible settings
+                self.rollout_config.training.torch_dtype = torch.float32
+                self.rollout_config.training.attn_implementation = "eager"
+                print("[WARNING] CUDA is not available, using CPU-compatible settings.")
             
         if self.hybrid_engine:
             # create actor_rollout class for the hybrid engine
@@ -938,7 +945,7 @@ class RayPPOTrainer(object):
         """
         response_length = batch.batch['responses'].shape[-1]
         response_mask = batch.batch['attention_mask'][:, -response_length:]
-        
+
         # Initialize action mask (all tokens initially considered as actions)
         action_mask = torch.ones_like(response_mask)
         
