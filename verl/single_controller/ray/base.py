@@ -37,6 +37,73 @@ __all__ = ['Worker', 'RayResourcePool', 'RayClassWithInitArgs', 'RayWorkerGroup'
 
 def _default_generate_function(worker_group, method_name, dispatch_mode):
     """Default function generator for worker methods"""
+    from verl.single_controller.base.decorator import (
+        Dispatch, Execute, 
+        dispatch_one_to_all, dispatch_all_to_all, collect_all_to_all,
+        get_predefined_dispatch_fn
+    )
+    import inspect
+    import traceback
+    
+    # Handle complex dispatch_mode dictionary (from @register decorator)
+    if isinstance(dispatch_mode, dict):
+        # Extract components from the dictionary
+        mode = dispatch_mode.get('dispatch_mode')
+        execute_mode = dispatch_mode.get('execute_mode', Execute.ALL)
+        blocking = dispatch_mode.get('blocking', True)
+        
+        try:
+            # Get predefined functions from the dispatch mode
+            dispatch_funcs = get_predefined_dispatch_fn(mode)
+            dispatch_fn = dispatch_funcs.get('dispatch_fn')
+            collect_fn = dispatch_funcs.get('collect_fn')
+            
+            # Define execute function based on execute_mode
+            if execute_mode == Execute.RANK_ZERO:
+                def execute_fn(method_name, *args, **kwargs):
+                    return worker_group.execute_rank_zero(method_name, *args, **kwargs)
+            else:
+                def execute_fn(method_name, *args, **kwargs):
+                    return worker_group.execute_all(method_name, *args, **kwargs)
+            
+            # Check the signature of collect_fn and dispatch_fn
+            collect_sig = inspect.signature(collect_fn)
+            dispatch_sig = inspect.signature(dispatch_fn)
+            
+            # Collect functions typically take 1 or 2 args (output only, or worker_group+output)
+            needs_worker_group_for_collect = len(collect_sig.parameters) > 1
+            
+            def func(self, *args, **kwargs):
+                try:
+                    # Dispatch phase - always pass self (which is the worker_group) as first arg
+                    args, kwargs = dispatch_fn(self, *args, **kwargs) 
+                    
+                    # Execute phase
+                    output = execute_fn(method_name, *args, **kwargs)
+                    
+                    # Handle blocking outputs
+                    if blocking and (isinstance(output, ray.ObjectRef) or 
+                                   isinstance(output, list) and all(isinstance(o, ray.ObjectRef) for o in output)):
+                        output = ray.get(output)
+                    
+                    # Collect and return results - pass worker_group if needed
+                    if needs_worker_group_for_collect:
+                        return collect_fn(self, output)
+                    else:
+                        return collect_fn(output)
+                except Exception as e:
+                    print(f"Error executing method {method_name} with dispatch mode {mode}: {str(e)}")
+                    print(f"Traceback: {traceback.format_exc()}")
+                    raise
+                
+            return func
+        
+        except Exception as e:
+            print(f"Error setting up worker method for {mode} in {method_name}: {str(e)}")
+            print(f"Traceback: {traceback.format_exc()}")
+            raise ValueError(f"Failed to set up worker method for {mode} in {method_name}: {str(e)}")
+    
+    # Original implementation for simple Dispatch enum values
     # Define dispatch function based on mode
     if dispatch_mode == Dispatch.RANK_ZERO:
         def dispatch_fn(self, *args, **kwargs):
@@ -48,7 +115,7 @@ def _default_generate_function(worker_group, method_name, dispatch_mode):
         def dispatch_fn(self, *args, **kwargs):
             return dispatch_all_to_all(self, *args, **kwargs)
     else:
-        raise ValueError(f"Unsupported dispatch mode: {dispatch_mode}")
+        raise ValueError(f"Unsupported simple dispatch mode: {dispatch_mode}")
 
     # Define execute function based on mode
     if dispatch_mode == Dispatch.RANK_ZERO:
@@ -66,12 +133,17 @@ def _default_generate_function(worker_group, method_name, dispatch_mode):
         def collect_fn(output):
             return collect_all_to_all(worker_group, output)
 
-    def func(*args, **kwargs):
-        args, kwargs = dispatch_fn(worker_group, *args, **kwargs) 
-        output = execute_fn(method_name, *args, **kwargs)
-        if isinstance(output, ray.ObjectRef) or isinstance(output, list) and all(isinstance(o, ray.ObjectRef) for o in output):
-            output = ray.get(output)
-        return collect_fn(output)
+    def func(self, *args, **kwargs):
+        try:
+            args, kwargs = dispatch_fn(self, *args, **kwargs) 
+            output = execute_fn(method_name, *args, **kwargs)
+            if isinstance(output, ray.ObjectRef) or isinstance(output, list) and all(isinstance(o, ray.ObjectRef) for o in output):
+                output = ray.get(output)
+            return collect_fn(output)
+        except Exception as e:
+            print(f"Error executing method {method_name} with dispatch mode {dispatch_mode}: {str(e)}")
+            print(f"Traceback: {traceback.format_exc()}")
+            raise
 
     return func
 
