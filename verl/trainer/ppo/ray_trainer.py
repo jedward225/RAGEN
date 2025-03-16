@@ -458,7 +458,7 @@ class RayPPOTrainer(object):
     def init_workers(self):
         """Initialize all Ray workers needed for PPO training."""
         # Init resource pool
-        self.logger.info("Initialize workers...")
+        print("Initialize workers...")
         self.resource_pool_manager.create_resource_pool()
         
         config = OmegaConf.to_container(self.config, resolve=True)
@@ -474,7 +474,7 @@ class RayPPOTrainer(object):
         # Check for required config sections
         has_ref_config = 'ref' in config
         if has_ref_role and not has_ref_config:
-            self.logger.warning("RefPolicy role is defined but config.ref is missing. Skipping reference policy initialization.")
+            print("[WARNING] RefPolicy role is defined but config.ref is missing. Skipping reference policy initialization.")
             has_ref_role = False
             
         # Safely access config sections using get() to avoid KeyError
@@ -764,23 +764,33 @@ class RayPPOTrainer(object):
         The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
-
+        print(f"Starting training loop with n_gpus_per_node={self.config.trainer.n_gpus_per_node}, nnodes={self.config.trainer.nnodes}")
         
-        logger = self.logger
+        # Initialize global steps
         self.global_steps = 0
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
-            val_metrics = self._validate()
+        
+        if self.config.trainer.get('val_before_train', False):
+            print("Validating before training...")
+            metrics = self._validate()
+            print(f"Validation metrics: {metrics}")
+            
+            # Return early if val_only is set
             if self.config.trainer.get('val_only', False):
+                print("Validation only mode. Exiting.")
                 return
-
-        # we start from step 1
+                
+        # We start from step 1
         self.global_steps += 1
-
-
-
-        # Agent config preparation
+        
+        # Create a logger for LLMGenerationManager
+        import logging
+        logging_logger = logging.getLogger("LLMGenerationManager")
+        logging_logger.setLevel(logging.INFO)
+        if not logging_logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            logging_logger.addHandler(handler)
+        
         gen_config = GenerationConfig(
             max_turns=self.config.get('max_turns', 1),
             max_start_length=self.config.data.max_start_length,
@@ -800,7 +810,8 @@ class RayPPOTrainer(object):
             actor_rollout_wg=self.actor_rollout_wg,
             env_class=self.env_class,
             config=gen_config,
-            logger = logger,
+            logger=logging_logger,  # Use the proper logging logger
+            is_validation=False,
         )
 
         envs = [self.env.copy() for _ in range(self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n_agent)] 
@@ -1012,7 +1023,7 @@ class RayPPOTrainer(object):
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+                print(f"Metrics at step {self.global_steps}: {metrics}")
 
                 self.global_steps += 1
 
@@ -1120,8 +1131,8 @@ class RayPPOTrainer(object):
             actor_rollout_wg=self.actor_rollout_wg,
             env_class=self.env_class,
             config=gen_config,
-            logger = self.logger,
-            is_validation = True,
+            logger=logging_logger,  # Use the proper logging logger
+            is_validation=True,
         )
 
         envs = [self.val_env.copy() for _ in range(self.config.data.val_batch_size * self.config.actor_rollout_ref.rollout.n_agent)]
@@ -1215,7 +1226,6 @@ class RayPPOTrainer(object):
             global_metrics['validate_metric/n_high_arm'] = int(np.sum(batch_action == 2))
             global_metrics['validate_metric/n_invalid'] = int(np.sum(batch_action == 0))
         print("global_metrics", global_metrics)
-        self.logger.log(data=global_metrics, step=self.val_num)
         return global_metrics
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
