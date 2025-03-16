@@ -508,11 +508,11 @@ class RayPPOTrainer(object):
             # Add precision settings for Flash Attention compatibility
             # First check if CUDA is available
             if torch.cuda.is_available():
-                self.rollout_config.training.torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                self.rollout_config.training.torch_dtype = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
                 self.rollout_config.training.attn_implementation = "flash_attention_2"
             else:
                 # If CUDA is not available, use CPU-compatible settings
-                self.rollout_config.training.torch_dtype = torch.float32
+                self.rollout_config.training.torch_dtype = "float32"
                 self.rollout_config.training.attn_implementation = "eager"
                 print("[WARNING] CUDA is not available, using CPU-compatible settings.")
             
