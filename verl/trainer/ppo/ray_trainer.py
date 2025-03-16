@@ -456,32 +456,63 @@ class RayPPOTrainer(object):
 
     def init_workers(self):
         """Init resource pool and worker group"""
+        # init resource pool
         self.resource_pool_manager.create_resource_pool()
 
+        # Create worker class dictionary for each resource pool
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
-        # create actor and rollout
+        # setup rollout worker config
+        self.rollout_config = OmegaConf.create()
+        with open_dict(self.rollout_config):
+            self.rollout_config.training = OmegaConf.create()
+            self.rollout_config.training.stop_token = self.tokenizer.eos_token_id
+            self.rollout_config.training.pad_token = self.tokenizer.pad_token_id
+            self.rollout_config.training.min_length = self.config.data.min_response_length if hasattr(self.config.data, 'min_response_length') else 0
+            self.rollout_config.training.max_length = self.config.data.max_response_length
+            self.rollout_config.training.temperature = self.config.training.temperature
+            self.rollout_config.training.num_return_sequences = 1
+            self.rollout_config.training.max_obs_length = self.config.data.max_obs_length
+            self.rollout_config.training.binary_reward = self.config.training.binary_reward
+            self.rollout_config.training.length_penalty = self.config.training.length_penalty
+            
+            # Add precision settings for Flash Attention compatibility
+            self.rollout_config.training.torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            self.rollout_config.training.attn_implementation = "flash_attention_2"
+
         if self.hybrid_engine:
+            # create actor_rollout class for the hybrid engine
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            
+            # Add Flash Attention configuration to actor_rollout
+            actor_rollout_config = self.config.actor_rollout_ref.copy()
+            actor_rollout_config.torch_dtype = self.rollout_config.training.torch_dtype
+            actor_rollout_config.attn_implementation = self.rollout_config.training.attn_implementation
+            
             actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.ActorRollout],
-                                                     config=self.config.actor_rollout_ref,
-                                                     role='actor_rollout')
+                                                    config=actor_rollout_config,
+                                                    role='actor_rollout')
             self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
         else:
             raise NotImplementedError
 
         # create critic
         if self.config.algorithm.adv_estimator == 'gae':
-            # raise NotImplementedError("GAE requires a trained critic network which is not implemented in our repo. Consider changing config.optimization.adv_estimator with grpo/brpo/arpo.")
-        
-            ## original code here
             print("[DEBUG] GAE is used")
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
+            
+            # Add Flash Attention configuration to critic
+            critic_config = self.config.critic.copy()
+            critic_config.torch_dtype = self.rollout_config.training.torch_dtype
+            critic_config.attn_implementation = self.rollout_config.training.attn_implementation
+            
+            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], 
+                                             config=critic_config)
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
             self.use_critic = True
             
         elif self.config.algorithm.adv_estimator in ['grpo', 'brpo', 'arpo']:
+            print("[DEBUG] GRPO is used")
             self.use_critic = False   # use a first-step reference model instead, and use the "low_var_kl" instead
         else:
             raise NotImplementedError
@@ -489,16 +520,29 @@ class RayPPOTrainer(object):
         # create reference policy if needed
         if self.use_reference_policy:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+            
+            # Add Flash Attention configuration to ref policy
+            ref_policy_config = self.config.actor_rollout_ref.copy()
+            ref_policy_config.torch_dtype = self.rollout_config.training.torch_dtype
+            ref_policy_config.attn_implementation = self.rollout_config.training.attn_implementation
+            
             ref_policy_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RefPolicy],
-                                                  config=self.config.actor_rollout_ref,
-                                                  role='ref')
+                                                 config=ref_policy_config,
+                                                 role='ref')
             self.resource_pool_to_cls[resource_pool]['ref'] = ref_policy_cls
 
         # create a reward model if reward_fn is None
         if self.use_rm:
             # we create a RM here
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
+            
+            # Add Flash Attention configuration to reward model
+            rm_config = self.config.reward_model.copy()
+            rm_config.torch_dtype = self.rollout_config.training.torch_dtype
+            rm_config.attn_implementation = self.rollout_config.training.attn_implementation
+            
+            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], 
+                                         config=rm_config)
             self.resource_pool_to_cls[resource_pool]['rm'] = rm_cls
 
         # initialize WorkerGroup
@@ -508,28 +552,33 @@ class RayPPOTrainer(object):
         all_wg = {}
         self.wg_dicts = []
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-            wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls)
-            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
-            all_wg.update(spawn_wg)
-            # keep the referece of WorkerDict to support ray >= 2.31. Ref: https://github.com/ray-project/ray/pull/45699
-            self.wg_dicts.append(wg_dict)
+            # create colocated worker cls with a dict of role to cls
+            colocated_cls_dict = {}
+            for role, cls in class_dict.items():
+                colocated_cls_dict[role] = cls
+            colocated_worker_cls = create_colocated_worker_cls(colocated_cls_dict,
+                                                              RayClassWithInitArgs)
+
+            # create RayWorkerGroup
+            worker_group = self.ray_worker_group_cls(colocated_worker_cls, resource_pool=resource_pool)
+            self.wg_dicts.append(worker_group)
+            for role in class_dict.keys():
+                all_wg[role] = worker_group
+
+        # create worker shortcuts
+        if self.hybrid_engine:
+            self.actor_rollout_wg = all_wg['actor_rollout']
+        else:
+            raise NotImplementedError
 
         if self.use_critic:
             self.critic_wg = all_wg['critic']
-            self.critic_wg.init_model()
-
+            
         if self.use_reference_policy:
-            self.ref_policy_wg = all_wg['ref']
-            self.ref_policy_wg.init_model()
-
+            self.ref_wg = all_wg['ref']
+            
         if self.use_rm:
             self.rm_wg = all_wg['rm']
-            self.rm_wg.init_model()
-
-        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg['actor_rollout']
-        self.actor_rollout_wg.init_model()
 
     def _save_checkpoint(self):
         actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
@@ -547,21 +596,44 @@ class RayPPOTrainer(object):
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
-        attention_mask = batch.batch['attention_mask']
-        batch_size = attention_mask.shape[0]
-        global_seqlen_lst = attention_mask.view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
-        world_size = self.actor_rollout_wg.world_size
-        global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst,
-                                                              k_partitions=world_size,
-                                                              equal_size=True)
-        # reorder based on index. The data will be automatically equally partitioned by dispatch function
-        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
-        batch.reorder(global_idx)
-        global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst,
-                                                    partitions=global_partition_lst,
-                                                    prefix=logging_prefix) 
-        metrics.update(global_balance_stats)
-    
+        resp_info = _compute_response_info(batch)
+        
+        # Get sequence lengths (prompt + response lengths)
+        sequence_lengths = resp_info['prompt_length'] + resp_info['response_length']
+        
+        # Get batch size and number of sequences
+        batch_size = sequence_lengths.size(0)
+
+        # Check if we are using model parallel
+        if self.config.actor_rollout_ref.actor.world_size > 1:
+            # Get the number of dp ranks
+            dp_world_size = self.config.actor_rollout_ref.actor.dp_world_size
+
+            # Get balanced partitions based on sequence lengths
+            reorder_idxs, partition_stats = get_seqlen_balanced_partitions(
+                sequence_lengths, dp_world_size
+            )
+
+            if not isinstance(reorder_idxs, torch.Tensor):
+                reorder_idxs = torch.tensor(reorder_idxs)
+
+            # Log sequence length distribution if needed
+            log_seqlen_unbalance(
+                partition_stats, batch_size, dp_world_size,
+                metrics, logging_prefix
+            )
+
+            # Apply reordering to the batch
+            batch = batch.reindex(reorder_idxs)
+        
+        # Ensure loss mask is in the correct precision
+        if 'loss_mask' in batch.batch:
+            device = batch.batch['responses'].device
+            dtype = batch.batch['responses'].dtype
+            batch.batch['loss_mask'] = batch.batch['loss_mask'].to(device=device, dtype=dtype)
+            
+        return batch, metrics
+
     def fit(self):
         """
         The training loop of PPO.
@@ -710,7 +782,6 @@ class RayPPOTrainer(object):
                         batch.non_tensor_batch['bandit_metrics'] = np.array([0 for _ in range(len(envs))], dtype=object)
                         for idx, env in enumerate(envs):
                             batch.non_tensor_batch['bandit_metrics'][idx] = env.get_last_action()
-
                     # metrics for actions
                     batch.non_tensor_batch['total_env'] = np.array([1 for _ in range(len(envs))], dtype=object)
                     batch.non_tensor_batch['finished_env'] = np.array([0 for _ in range(len(envs))], dtype=object)
@@ -727,6 +798,7 @@ class RayPPOTrainer(object):
                         batch.non_tensor_batch['valid_action'][idx] = sum(1 for x in tracking_vars['actions_valid'] if x is not None)
                         batch.non_tensor_batch['effective_action'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None)
                         batch.non_tensor_batch['effective_action_ratio'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None) / len(tracking_vars['actions'])
+
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(final_gen_batch_output)
 
@@ -864,7 +936,8 @@ class RayPPOTrainer(object):
                 end_token_pos = start_token_pos + len(state_tokens)
                 
                 # Set observation tokens to 0 in the action mask (exclude from loss)
-                action_mask[i, start_token_pos:end_token_pos] = 0
+                if start_token_pos < action_mask.shape[1] and end_token_pos <= action_mask.shape[1]:
+                    action_mask[i, start_token_pos:end_token_pos] = 0
         
         # Apply response mask to ensure we only consider valid tokens
         loss_mask = action_mask * response_mask
