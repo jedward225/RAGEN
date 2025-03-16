@@ -458,9 +458,12 @@ class RayPPOTrainer(object):
         """Init resource pool and worker group"""
         # init resource pool
         self.resource_pool_manager.create_resource_pool()
-
-        # Create worker class dictionary for each resource pool
+        
+        # Initialize class dictionary with most implementation details
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+        
+        # Initialize worker group list
+        self.wg_dicts = []
 
         # setup rollout worker config
         self.rollout_config = OmegaConf.create()
@@ -469,7 +472,29 @@ class RayPPOTrainer(object):
             self.rollout_config.training.stop_token = self.tokenizer.eos_token_id
             self.rollout_config.training.pad_token = self.tokenizer.pad_token_id
             
-            # Access data attributes safely
+            # Convert torch.dtype to string for OmegaConf compatibility
+            # Important: Use strings for torch data types with OmegaConf
+            if hasattr(self.config.actor_rollout_ref, 'model') and hasattr(self.config.actor_rollout_ref.model, 'torch_dtype'):
+                if self.config.actor_rollout_ref.model.torch_dtype == 'torch.float16':
+                    self.rollout_config.training.torch_dtype = 'torch.float16'
+                elif self.config.actor_rollout_ref.model.torch_dtype == 'torch.bfloat16':
+                    self.rollout_config.training.torch_dtype = 'torch.bfloat16'
+                else:
+                    self.rollout_config.training.torch_dtype = 'torch.float32'
+            else:
+                self.rollout_config.training.torch_dtype = 'torch.float16'
+                
+            # Set attn_implementation if present in config, otherwise default to "flash_attention_2"
+            if hasattr(self.config.actor_rollout_ref, 'model') and hasattr(self.config.actor_rollout_ref.model, 'attn_implementation'):
+                self.rollout_config.training.attn_implementation = self.config.actor_rollout_ref.model.attn_implementation
+            else:
+                # Check if CUDA is available before defaulting to flash attention
+                if torch.cuda.is_available():
+                    self.rollout_config.training.attn_implementation = "flash_attention_2"
+                else:
+                    self.rollout_config.training.attn_implementation = "eager"
+                    
+            # Add required training parameters
             min_response_length = 0
             if hasattr(self.config, 'data') and hasattr(self.config.data, 'min_response_length'):
                 min_response_length = self.config.data.min_response_length
@@ -480,11 +505,9 @@ class RayPPOTrainer(object):
                 max_length = self.config.data.max_response_length
             self.rollout_config.training.max_length = max_length
             
-            # Use default values and get temperature from rollout config if available
-            temperature_value = 0.7
-            if hasattr(self.config, 'actor_rollout_ref') and hasattr(self.config.actor_rollout_ref, 'rollout') and hasattr(self.config.actor_rollout_ref.rollout, 'temperature'):
-                temperature_value = self.config.actor_rollout_ref.rollout.temperature
-            self.rollout_config.training.temperature = temperature_value
+            self.rollout_config.training.temperature = 0.7
+            if hasattr(self.config.actor_rollout_ref, 'rollout') and hasattr(self.config.actor_rollout_ref.rollout, 'temperature'):
+                self.rollout_config.training.temperature = self.config.actor_rollout_ref.rollout.temperature
             
             self.rollout_config.training.num_return_sequences = 1
             
@@ -493,61 +516,7 @@ class RayPPOTrainer(object):
             if hasattr(self.config, 'data') and hasattr(self.config.data, 'max_obs_length'):
                 max_obs_length = self.config.data.max_obs_length
             self.rollout_config.training.max_obs_length = max_obs_length
-            
-            # Use default values for binary_reward and length_penalty
-            binary_reward_value = False
-            length_penalty_value = False
-            if hasattr(self.config, 'algorithm'):
-                if hasattr(self.config.algorithm, 'binary_reward'):
-                    binary_reward_value = self.config.algorithm.binary_reward
-                if hasattr(self.config.algorithm, 'length_penalty'):
-                    length_penalty_value = self.config.algorithm.length_penalty
-            self.rollout_config.training.binary_reward = binary_reward_value
-            self.rollout_config.training.length_penalty = length_penalty_value
-            
-            # Add precision settings for Flash Attention compatibility
-            # First check if CUDA is available
-            if torch.cuda.is_available():
-                self.rollout_config.training.torch_dtype = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
-                self.rollout_config.training.attn_implementation = "flash_attention_2"
-            else:
-                # If CUDA is not available, use CPU-compatible settings
-                self.rollout_config.training.torch_dtype = "float32"
-                self.rollout_config.training.attn_implementation = "eager"
-                print("[WARNING] CUDA is not available, using CPU-compatible settings.")
-            
-        # Explicitly define which methods should be exposed to Ray remote call system
-        # This makes sure these methods get properly registered with Ray
-        actor_rollout_methods = [
-            'generate_sequences', 'compute_log_prob', 'compute_ref_log_prob', 
-            'compute_values', 'update_actor', 'update_critic', 'compute_rm_score',
-            'save_checkpoint', 'load_model_parameters'
-        ]
-        
-        # Create modified Ray actor class that explicitly includes the methods
-        from verl.workers.fsdp_workers import ActorRolloutRefWorker
-        
-        # Use the original actor class to make a new one with explicit method registration
-        import types
-        import inspect
-        
-        # Create a dict of the methods we want to explicitly include
-        actor_methods = {}
-        for method_name in actor_rollout_methods:
-            if hasattr(ActorRolloutRefWorker, method_name):
-                method = getattr(ActorRolloutRefWorker, method_name)
-                actor_methods[method_name] = method
-        
-        # Create a new class with the methods explicitly included
-        ActorRolloutWithMethods = type('ActorRolloutWithMethods', (ActorRolloutRefWorker,), actor_methods)
-        
-        # Register this new class with Ray
-        import ray
-        ActorRolloutRayClass = ray.remote(ActorRolloutWithMethods)
-        
-        # Store this class for later use
-        actor_rollout_cls = ActorRolloutRayClass
-        
+
         if self.hybrid_engine:
             # create actor_rollout class for the hybrid engine
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
@@ -555,132 +524,98 @@ class RayPPOTrainer(object):
             # Add Flash Attention configuration to actor_rollout
             actor_rollout_config = self.config.actor_rollout_ref.copy()
             
-            # Use open_dict to safely modify the config
+            # Use open_dict to safely modify the config if needed
             with open_dict(actor_rollout_config):
-                # Instead of setting directly at the top level, add these to model config
+                # Make sure model config exists
                 if not hasattr(actor_rollout_config, 'model'):
                     actor_rollout_config.model = OmegaConf.create()
                 
                 # Add the dtype and attention implementation to the model config
+                # These values are already string representations
                 actor_rollout_config.model.torch_dtype = self.rollout_config.training.torch_dtype
                 actor_rollout_config.model.attn_implementation = self.rollout_config.training.attn_implementation
             
-            actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.ActorRollout],
-                                                   args=(),
-                                                   kwargs={'config': actor_rollout_config,
-                                                          'tokenizer': self.tokenizer,
-                                                          'rollout_config': self.rollout_config,
-                                                          'role': 'actor_rollout'})
-            self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
+            # Add to resource pool with proper key - use string key matching the role
+            self.resource_pool_to_cls[resource_pool][Role.ActorRollout.name.lower()] = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.ActorRollout],
+                kwargs={
+                    'config': actor_rollout_config,
+                    'tokenizer': self.tokenizer,
+                    'rollout_config': self.rollout_config,
+                    'role': Role.ActorRollout.name.lower()
+                }
+            )
+            
+            # If critic is needed, set it up similarly
+            if self.use_critic:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+                self.resource_pool_to_cls[resource_pool][Role.Critic.name.lower()] = RayClassWithInitArgs(
+                    self.role_worker_mapping[Role.Critic],
+                    kwargs={
+                        'config': self.config.critic,
+                        'tokenizer': self.tokenizer,
+                        'role': Role.Critic.name.lower()
+                    }
+                )
+                
+            # Set up reference policy if needed
+            if self.use_reference_policy:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.Ref)
+                self.resource_pool_to_cls[resource_pool][Role.Ref.name.lower()] = RayClassWithInitArgs(
+                    self.role_worker_mapping[Role.Ref],
+                    kwargs={
+                        'config': self.config.ref,
+                        'tokenizer': self.tokenizer,
+                        'role': Role.Ref.name.lower()
+                    }
+                )
+                
+            # Set up reward model if needed
+            if self.use_rm:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RM)
+                self.resource_pool_to_cls[resource_pool][Role.RM.name.lower()] = RayClassWithInitArgs(
+                    self.role_worker_mapping[Role.RM],
+                    kwargs={
+                        'config': self.config.rm,
+                        'tokenizer': self.tokenizer,
+                        'role': Role.RM.name.lower()
+                    }
+                )
+            
         else:
             raise NotImplementedError
 
-        # create critic
-        if self.config.algorithm.get('adv_estimator') == 'gae':
-            print("[DEBUG] GAE is used")
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            
-            # Add Flash Attention configuration to critic
-            critic_config = self.config.critic.copy()
-            
-            # Use open_dict to safely modify the config
-            with open_dict(critic_config):
-                # Instead of setting directly at the top level, add these to model config
-                if not hasattr(critic_config, 'model'):
-                    critic_config.model = OmegaConf.create()
-                
-                # Add the dtype and attention implementation to the model config
-                critic_config.model.torch_dtype = self.rollout_config.training.torch_dtype
-                critic_config.model.attn_implementation = self.rollout_config.training.attn_implementation
-            
-            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], 
-                                             config=critic_config)
-            self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
-            self.use_critic = True
-            
-        elif self.config.algorithm.get('adv_estimator') in ['grpo', 'brpo', 'arpo']:
-            print("[DEBUG] GRPO is used")
-            self.use_critic = False   # use a first-step reference model instead, and use the "low_var_kl" instead
-        else:
-            raise NotImplementedError
-
-        # create reference policy if needed
-        if self.use_reference_policy:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
-            
-            # Add Flash Attention configuration to ref policy
-            ref_policy_config = self.config.actor_rollout_ref.copy()
-            
-            # Use open_dict to safely modify the config
-            with open_dict(ref_policy_config):
-                # Instead of setting directly at the top level, add these to model config
-                if not hasattr(ref_policy_config, 'model'):
-                    ref_policy_config.model = OmegaConf.create()
-                
-                # Add the dtype and attention implementation to the model config
-                ref_policy_config.model.torch_dtype = self.rollout_config.training.torch_dtype
-                ref_policy_config.model.attn_implementation = self.rollout_config.training.attn_implementation
-            
-            ref_policy_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RefPolicy],
-                                                 config=ref_policy_config,
-                                                 role='ref')
-            self.resource_pool_to_cls[resource_pool]['ref'] = ref_policy_cls
-
-        # create a reward model if reward_fn is None
-        if self.use_rm:
-            # we create a RM here
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-            
-            # Add Flash Attention configuration to reward model
-            rm_config = self.config.reward_model.copy()
-            
-            # Use open_dict to safely modify the config
-            with open_dict(rm_config):
-                # Instead of setting directly at the top level, add these to model config
-                if not hasattr(rm_config, 'model'):
-                    rm_config.model = OmegaConf.create()
-                
-                # Add the dtype and attention implementation to the model config
-                rm_config.model.torch_dtype = self.rollout_config.training.torch_dtype
-                rm_config.model.attn_implementation = self.rollout_config.training.attn_implementation
-            
-            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], 
-                                         config=rm_config)
-            self.resource_pool_to_cls[resource_pool]['rm'] = rm_cls
-
-        # initialize WorkerGroup
-        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
-        # you should not use `create_colocated_worker_cls`. Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
+        # Create worker groups
         all_wg = {}
-        self.wg_dicts = []
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            # create colocated worker cls with a dict of role to cls
+            # Create colocated worker cls with a dict of role to cls
             colocated_cls_dict = {}
             for role, cls in class_dict.items():
                 colocated_cls_dict[role] = cls
             colocated_worker_cls = create_colocated_worker_cls(colocated_cls_dict)
 
             # create RayWorkerGroup
-            worker_group = self.ray_worker_group_cls(ray_cls_with_init=colocated_worker_cls, resource_pool=resource_pool)
+            worker_group = RayWorkerGroup(
+                resource_pool=resource_pool,
+                ray_cls_with_init=colocated_worker_cls,
+                bin_pack=True
+            )
             self.wg_dicts.append(worker_group)
             for role in class_dict.keys():
                 all_wg[role] = worker_group
 
         # create worker shortcuts
         if self.hybrid_engine:
-            self.actor_rollout_wg = all_wg['actor_rollout']
-        else:
-            raise NotImplementedError
-
+            self.actor_rollout_wg = all_wg[Role.ActorRollout.name.lower()]
+        
         if self.use_critic:
-            self.critic_wg = all_wg['critic']
+            self.critic_wg = all_wg[Role.Critic.name.lower()]
             
         if self.use_reference_policy:
-            self.ref_wg = all_wg['ref']
+            self.ref_wg = all_wg[Role.Ref.name.lower()]
             
         if self.use_rm:
-            self.rm_wg = all_wg['rm']
+            self.rm_wg = all_wg[Role.RM.name.lower()]
             
         # Direct fix for the worker method issue
         # The issue is that the worker methods aren't properly exposed through Ray
@@ -751,46 +686,6 @@ class RayPPOTrainer(object):
             critic_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
                 self.config.trainer.default_hdfs_dir, 'critic')
             self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
-
-    def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
-        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
-        resp_info = _compute_response_info(batch)
-        
-        # Get sequence lengths (prompt + response lengths)
-        sequence_lengths = resp_info['prompt_length'] + resp_info['response_length']
-        
-        # Get batch size and number of sequences
-        batch_size = sequence_lengths.size(0)
-
-        # Check if we are using model parallel
-        if self.config.actor_rollout_ref.actor.get('world_size', 1) > 1:
-            # Get the number of dp ranks
-            dp_world_size = self.config.actor_rollout_ref.actor.get('dp_world_size', 1)
-
-            # Get balanced partitions based on sequence lengths
-            reorder_idxs, partition_stats = get_seqlen_balanced_partitions(
-                sequence_lengths, dp_world_size
-            )
-
-            if not isinstance(reorder_idxs, torch.Tensor):
-                reorder_idxs = torch.tensor(reorder_idxs)
-
-            # Log sequence length distribution if needed
-            log_seqlen_unbalance(
-                partition_stats, batch_size, dp_world_size,
-                metrics, logging_prefix
-            )
-
-            # Apply reordering to the batch
-            batch = batch.reindex(reorder_idxs)
-        
-        # Ensure loss mask is in the correct precision
-        if 'loss_mask' in batch.batch:
-            device = batch.batch['responses'].device
-            dtype = batch.batch['responses'].dtype
-            batch.batch['loss_mask'] = batch.batch['loss_mask'].to(device=device, dtype=dtype)
-            
-        return batch, metrics
 
     def fit(self):
         """
@@ -1226,18 +1121,8 @@ class RayPPOTrainer(object):
                     test_batch.non_tensor_batch['effective_action'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None)
                     test_batch.non_tensor_batch['effective_action_ratio'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None) / len(tracking_vars['actions'])
 
-                # action metrics
-                metrics['total_env'].append(test_batch.non_tensor_batch['total_env'])
-                metrics['finished_env'].append(test_batch.non_tensor_batch['finished_env'])
-                metrics['success_env'].append(test_batch.non_tensor_batch['success_env'])
-                metrics['traj_length'].append(test_batch.non_tensor_batch['traj_length'])
-                metrics['valid_action'].append(test_batch.non_tensor_batch['valid_action'])
-                metrics['effective_action'].append(test_batch.non_tensor_batch['effective_action'])
-                metrics['effective_action_ratio'].append(test_batch.non_tensor_batch['effective_action_ratio'])
-
                 # Accumulate batch metrics into global storage
                 global_token_scores.append(test_batch.non_tensor_batch['reward'])
-
 
         global_scores = np.concatenate(global_token_scores, axis=0)
         global_metrics = {
@@ -1261,3 +1146,43 @@ class RayPPOTrainer(object):
         print("global_metrics", global_metrics)
         self.logger.log(data=global_metrics, step=self.val_num)
         return global_metrics
+
+    def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
+        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+        resp_info = _compute_response_info(batch)
+        
+        # Get sequence lengths (prompt + response lengths)
+        sequence_lengths = resp_info['prompt_length'] + resp_info['response_length']
+        
+        # Get batch size and number of sequences
+        batch_size = sequence_lengths.size(0)
+
+        # Check if we are using model parallel
+        if self.config.actor_rollout_ref.actor.get('world_size', 1) > 1:
+            # Get the number of dp ranks
+            dp_world_size = self.config.actor_rollout_ref.actor.get('dp_world_size', 1)
+
+            # Get balanced partitions based on sequence lengths
+            reorder_idxs, partition_stats = get_seqlen_balanced_partitions(
+                sequence_lengths, dp_world_size
+            )
+
+            if not isinstance(reorder_idxs, torch.Tensor):
+                reorder_idxs = torch.tensor(reorder_idxs)
+
+            # Log sequence length distribution if needed
+            log_seqlen_unbalance(
+                partition_stats, batch_size, dp_world_size,
+                metrics, logging_prefix
+            )
+
+            # Apply reordering to the batch
+            batch = batch.reindex(reorder_idxs)
+        
+        # Ensure loss mask is in the correct precision
+        if 'loss_mask' in batch.batch:
+            device = batch.batch['responses'].device
+            dtype = batch.batch['responses'].dtype
+            batch.batch['loss_mask'] = batch.batch['loss_mask'].to(device=device, dtype=dtype)
+            
+        return batch, metrics
