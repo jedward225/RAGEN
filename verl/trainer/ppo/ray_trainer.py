@@ -522,12 +522,20 @@ class RayPPOTrainer(object):
             
             # Add Flash Attention configuration to actor_rollout
             actor_rollout_config = self.config.actor_rollout_ref.copy()
-            actor_rollout_config.torch_dtype = self.rollout_config.training.torch_dtype
-            actor_rollout_config.attn_implementation = self.rollout_config.training.attn_implementation
+            
+            # Use open_dict to safely modify the config
+            with open_dict(actor_rollout_config):
+                # Instead of setting directly at the top level, add these to model config
+                if not hasattr(actor_rollout_config, 'model'):
+                    actor_rollout_config.model = OmegaConf.create()
+                
+                # Add the dtype and attention implementation to the model config
+                actor_rollout_config.model.torch_dtype = self.rollout_config.training.torch_dtype
+                actor_rollout_config.model.attn_implementation = self.rollout_config.training.attn_implementation
             
             actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.ActorRollout],
-                                                    config=actor_rollout_config,
-                                                    role='actor_rollout')
+                                                   config=actor_rollout_config,
+                                                   role='actor_rollout')
             self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
         else:
             raise NotImplementedError
@@ -539,8 +547,16 @@ class RayPPOTrainer(object):
             
             # Add Flash Attention configuration to critic
             critic_config = self.config.critic.copy()
-            critic_config.torch_dtype = self.rollout_config.training.torch_dtype
-            critic_config.attn_implementation = self.rollout_config.training.attn_implementation
+            
+            # Use open_dict to safely modify the config
+            with open_dict(critic_config):
+                # Instead of setting directly at the top level, add these to model config
+                if not hasattr(critic_config, 'model'):
+                    critic_config.model = OmegaConf.create()
+                
+                # Add the dtype and attention implementation to the model config
+                critic_config.model.torch_dtype = self.rollout_config.training.torch_dtype
+                critic_config.model.attn_implementation = self.rollout_config.training.attn_implementation
             
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], 
                                              config=critic_config)
@@ -559,8 +575,16 @@ class RayPPOTrainer(object):
             
             # Add Flash Attention configuration to ref policy
             ref_policy_config = self.config.actor_rollout_ref.copy()
-            ref_policy_config.torch_dtype = self.rollout_config.training.torch_dtype
-            ref_policy_config.attn_implementation = self.rollout_config.training.attn_implementation
+            
+            # Use open_dict to safely modify the config
+            with open_dict(ref_policy_config):
+                # Instead of setting directly at the top level, add these to model config
+                if not hasattr(ref_policy_config, 'model'):
+                    ref_policy_config.model = OmegaConf.create()
+                
+                # Add the dtype and attention implementation to the model config
+                ref_policy_config.model.torch_dtype = self.rollout_config.training.torch_dtype
+                ref_policy_config.model.attn_implementation = self.rollout_config.training.attn_implementation
             
             ref_policy_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RefPolicy],
                                                  config=ref_policy_config,
@@ -574,8 +598,16 @@ class RayPPOTrainer(object):
             
             # Add Flash Attention configuration to reward model
             rm_config = self.config.reward_model.copy()
-            rm_config.torch_dtype = self.rollout_config.training.torch_dtype
-            rm_config.attn_implementation = self.rollout_config.training.attn_implementation
+            
+            # Use open_dict to safely modify the config
+            with open_dict(rm_config):
+                # Instead of setting directly at the top level, add these to model config
+                if not hasattr(rm_config, 'model'):
+                    rm_config.model = OmegaConf.create()
+                
+                # Add the dtype and attention implementation to the model config
+                rm_config.model.torch_dtype = self.rollout_config.training.torch_dtype
+                rm_config.model.attn_implementation = self.rollout_config.training.attn_implementation
             
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], 
                                          config=rm_config)
