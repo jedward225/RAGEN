@@ -131,7 +131,21 @@ class ActorRolloutRefWorker(Worker):
 
         torch_dtype = fsdp_config.get('model_dtype', None)
         if torch_dtype is None:
-            torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+            # Check if system config has torch_dtype
+            if hasattr(self.config, 'system') and hasattr(self.config.system, 'torch_dtype'):
+                dtype_str = self.config.system.torch_dtype
+                if dtype_str == "bfloat16":
+                    torch_dtype = torch.bfloat16
+                elif dtype_str == "float16":
+                    torch_dtype = torch.float16
+                else:
+                    torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+            else:
+                # For Qwen models, always use bfloat16 with Flash Attention
+                if 'qwen' in local_path.lower():
+                    torch_dtype = torch.bfloat16
+                else:
+                    torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
@@ -161,13 +175,18 @@ class ActorRolloutRefWorker(Worker):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            # For Qwen models, always use Flash Attention 2.0
+            attn_impl = 'flash_attention_2' if 'qwen' in local_path.lower() else 'eager'
             actor_module = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=local_path,
-                                                                torch_dtype=torch_dtype,
-                                                                config=actor_model_config,
-                                                                attn_implementation='flash_attention_2',
-                                                                trust_remote_code=trust_remote_code)
+                                                               torch_dtype=torch_dtype,
+                                                               config=actor_model_config,
+                                                               attn_implementation=attn_impl,
+                                                               trust_remote_code=trust_remote_code)
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
+            # Ensure the model is moved to GPU
+            if torch.cuda.is_available():
+                actor_module = actor_module.cuda()
 
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
@@ -691,6 +710,12 @@ class CriticWorker(Worker):
 
         torch_dtype = self.config.model.fsdp_config.get('model_dtype', 'fp32')
         torch_dtype = PrecisionType.to_dtype(torch_dtype)
+        
+        # For Qwen models, always use bfloat16 with Flash Attention
+        if 'qwen' in local_path.lower():
+            torch_dtype = torch.bfloat16
+        else:
+            torch_dtype = torch.float32
 
         from transformers import AutoConfig, AutoModelForTokenClassification
         from torch import nn
@@ -713,13 +738,13 @@ class CriticWorker(Worker):
             warnings.simplefilter("ignore")
             setattr(critic_model_config, 'classifier_dropout', 0.)
             setattr(critic_model_config, 'hidden_dropout', '0')
+            # For Qwen models, always use Flash Attention 2.0
+            attn_impl = 'flash_attention_2' if 'qwen' in local_path.lower() else 'eager'
             critic_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             torch_dtype=torch_dtype,
                                                                             config=critic_model_config,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation=attn_impl,
                                                                             trust_remote_code=trust_remote_code)
-
-            # some parameters may not in torch_dtype
             critic_module.to(torch_dtype)
 
             if config.model.get('enable_gradient_checkpointing', False):
@@ -953,6 +978,7 @@ class RewardModelWorker(Worker):
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             setattr(model_config, 'classifier_dropout', 0.)
+            setattr(model_config, 'hidden_dropout', '0')
             reward_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             config=model_config,
                                                                             torch_dtype=torch.bfloat16,

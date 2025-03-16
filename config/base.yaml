@@ -3,7 +3,7 @@
 rl_or_sft: "rl"
 # System settings
 system:
-  cuda_visible_devices: 0
+  cuda_visible_devices: 3
   n_gpus: 1
   multi_processing: "ray"
   vllm_attention_backend: "XFORMERS"
@@ -33,7 +33,7 @@ training:
   use_sft: false
   use_kl_loss: true # this means actor KL Loss
   no_think_rl: false
-  state_masking: false
+  state_masking: true
   binary_reward: false
   mask_state: false
   length_penalty: false
@@ -47,7 +47,7 @@ optimization:
   kl_coef: 0.001
   kl_loss_type: low_var_kl
   adv_estimator: gae
-  gpu_memory_utilization: 0.4
+  gpu_memory_utilization: 0.2
 
 # Logging settings
 logging:
