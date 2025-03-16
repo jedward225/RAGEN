@@ -549,39 +549,54 @@ class RayPPOTrainer(object):
             
             # If critic is needed, set it up similarly
             if self.use_critic:
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-                self.resource_pool_to_cls[resource_pool][Role.Critic.name] = RayClassWithInitArgs(
-                    self.role_worker_mapping[Role.Critic],
-                    kwargs={
-                        'config': self.config.critic,
-                        'tokenizer': self.tokenizer,
-                        'role': Role.Critic.name
-                    }
-                )
+                # Check if critic config exists
+                if not hasattr(self.config, 'critic'):
+                    print("[WARNING] Critic role is defined but config.critic is missing. Skipping critic initialization.")
+                    self.use_critic = False
+                else:
+                    resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+                    self.resource_pool_to_cls[resource_pool][Role.Critic.name] = RayClassWithInitArgs(
+                        self.role_worker_mapping[Role.Critic],
+                        kwargs={
+                            'config': self.config.critic,
+                            'tokenizer': self.tokenizer,
+                            'role': Role.Critic.name
+                        }
+                    )
                 
             # Set up reference policy if needed
             if self.use_reference_policy:
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
-                self.resource_pool_to_cls[resource_pool][Role.RefPolicy.name] = RayClassWithInitArgs(
-                    self.role_worker_mapping[Role.RefPolicy],
-                    kwargs={
-                        'config': self.config.ref,
-                        'tokenizer': self.tokenizer,
-                        'role': Role.RefPolicy.name
-                    }
-                )
+                # Check if reference policy config exists
+                if not hasattr(self.config, 'ref'):
+                    print("[WARNING] RefPolicy role is defined but config.ref is missing. Skipping reference policy initialization.")
+                    self.use_reference_policy = False
+                else:
+                    resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+                    self.resource_pool_to_cls[resource_pool][Role.RefPolicy.name] = RayClassWithInitArgs(
+                        self.role_worker_mapping[Role.RefPolicy],
+                        kwargs={
+                            'config': self.config.ref,
+                            'tokenizer': self.tokenizer,
+                            'role': Role.RefPolicy.name
+                        }
+                    )
                 
             # Set up reward model if needed
             if self.use_rm:
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-                self.resource_pool_to_cls[resource_pool][Role.RewardModel.name] = RayClassWithInitArgs(
-                    self.role_worker_mapping[Role.RewardModel],
-                    kwargs={
-                        'config': self.config.rm,
-                        'tokenizer': self.tokenizer,
-                        'role': Role.RewardModel.name
-                    }
-                )
+                # Check if reward model config exists
+                if not hasattr(self.config, 'rm'):
+                    print("[WARNING] RewardModel role is defined but config.rm is missing. Skipping reward model initialization.")
+                    self.use_rm = False
+                else:
+                    resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+                    self.resource_pool_to_cls[resource_pool][Role.RewardModel.name] = RayClassWithInitArgs(
+                        self.role_worker_mapping[Role.RewardModel],
+                        kwargs={
+                            'config': self.config.rm,
+                            'tokenizer': self.tokenizer,
+                            'role': Role.RewardModel.name
+                        }
+                    )
             
         else:
             raise NotImplementedError
@@ -605,17 +620,18 @@ class RayPPOTrainer(object):
             for role in class_dict.keys():
                 all_wg[role] = worker_group
 
-        # create worker shortcuts
-        if self.hybrid_engine:
+        # Create worker shortcuts (only if the corresponding worker exists)
+        # Make sure to check both flag and presence in all_wg
+        if self.hybrid_engine and Role.ActorRollout.name in all_wg:
             self.actor_rollout_wg = all_wg[Role.ActorRollout.name]
         
-        if self.use_critic:
+        if self.use_critic and Role.Critic.name in all_wg:
             self.critic_wg = all_wg[Role.Critic.name]
             
-        if self.use_reference_policy:
+        if self.use_reference_policy and Role.RefPolicy.name in all_wg:
             self.ref_wg = all_wg[Role.RefPolicy.name]
             
-        if self.use_rm:
+        if self.use_rm and Role.RewardModel.name in all_wg:
             self.rm_wg = all_wg[Role.RewardModel.name]
             
         # Direct fix for the worker method issue
@@ -656,13 +672,13 @@ class RayPPOTrainer(object):
             
             # Create wrapper methods for each worker group
             worker_groups = []
-            if hasattr(self, 'actor_rollout_wg'):
+            if hasattr(self, 'actor_rollout_wg') and hasattr(self.actor_rollout_wg, '_workers') and len(self.actor_rollout_wg._workers) > 0:
                 worker_groups.append(('actor_rollout_wg', self.actor_rollout_wg))
-            if hasattr(self, 'critic_wg'):
+            if hasattr(self, 'critic_wg') and hasattr(self.critic_wg, '_workers') and len(self.critic_wg._workers) > 0:
                 worker_groups.append(('critic_wg', self.critic_wg))
-            if hasattr(self, 'ref_wg'):
+            if hasattr(self, 'ref_wg') and hasattr(self.ref_wg, '_workers') and len(self.ref_wg._workers) > 0:
                 worker_groups.append(('ref_wg', self.ref_wg))
-            if hasattr(self, 'rm_wg'):
+            if hasattr(self, 'rm_wg') and hasattr(self.rm_wg, '_workers') and len(self.rm_wg._workers) > 0:
                 worker_groups.append(('rm_wg', self.rm_wg))
                 
             # Add method wrappers to all worker groups
@@ -670,10 +686,12 @@ class RayPPOTrainer(object):
                 for method_name in key_methods:
                     # Only add methods if they don't already exist
                     if not hasattr(group, method_name):
-                        wrapper = create_worker_method_wrapper(group, method_name)
-                        setattr(group, method_name, types.MethodType(wrapper, group))
-                        print(f"[INFO] Added '{method_name}' method to {group_name}")
-
+                        try:
+                            wrapper = create_worker_method_wrapper(group, method_name)
+                            setattr(group, method_name, types.MethodType(wrapper, group))
+                            print(f"[INFO] Added '{method_name}' method to {group_name}")
+                        except Exception as e:
+                            print(f"[WARNING] Failed to add method '{method_name}' to {group_name}: {e}")
     def _save_checkpoint(self):
         actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
                                         f'global_step_{self.global_steps}')
