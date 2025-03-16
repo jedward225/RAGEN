@@ -14,7 +14,6 @@
 
 import time
 from typing import Dict, List, Any, Tuple
-
 import ray
 from ray.util import list_named_actors
 from ray.util.placement_group import placement_group, PlacementGroup
@@ -25,6 +24,13 @@ from verl.single_controller.base import WorkerGroup, ResourcePool, ClassWithInit
 
 __all__ = ['Worker']
 
+import socket
+
+def find_free_port():
+    """Find a free port on the current node."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
 
 def get_random_string(length: int) -> str:
     import random
@@ -264,18 +270,77 @@ class RayWorkerGroup(WorkerGroup):
                 self._worker_names.append(name)
 
                 if rank == 0:
+                    # Create the register center for the first worker in the group
+                    # This needs to be done before other workers try to connect
+                    # Get master address and port info
+                    master_addr = ray.util.get_node_ip_address()
+                    master_port = str(find_free_port())
+                    rank_zero_info = {
+                        "MASTER_ADDR": master_addr,
+                        "MASTER_PORT": master_port,
+                    }
+
+                    # Import here to avoid circular imports
+                    from verl.single_controller.base.register_center.ray import create_worker_group_register_center
+                    
+                    # Create the register center actor
+                    register_center_name = f"{self.name_prefix}_register_center"
+                    register_center = create_worker_group_register_center(
+                        name=register_center_name,
+                        info=rank_zero_info
+                    )
+                    print(f"[INFO] Created register center actor: {register_center_name}")
+                    
+                    # Store master info for later workers
+                    self._master_addr = master_addr
+                    self._master_port = master_port
+                    
+                else:
+                    # For non-rank-0 workers, wait for the register center to be available
                     register_center_actor = None
                     for _ in range(120):
                         if f"{self.name_prefix}_register_center" not in list_named_actors():
                             time.sleep(1)
+                            print(f"[INFO] Waiting for register center actor: {self.name_prefix}_register_center")
                         else:
                             register_center_actor = ray.get_actor(f"{self.name_prefix}_register_center")
                             break
-                    assert register_center_actor is not None, f"failed to get register_center_actor: {self.name_prefix}_register_center in {list_named_actors(all_namespaces=True)}"
-                    rank_zero_info = ray.get(register_center_actor.get_rank_zero_info.remote())
-                    self._master_addr, self._master_port = rank_zero_info['MASTER_ADDR'], rank_zero_info['MASTER_PORT']
-                    # print(f"rank_zero_info: {rank_zero_info}")
-                    # print(f"master_addr: {self._master_addr}, master_port: {self._master_port}")
+                    
+                    # If we failed to find the register center after waiting, we still need the master info
+                    # from another source, so we'll use the values from the first worker in the group
+                    if register_center_actor is None:
+                        print(f"[WARNING] Failed to get register_center_actor: {self.name_prefix}_register_center in {list_named_actors(all_namespaces=True)}")
+                        # If we already have master info from rank 0, use it
+                        if hasattr(self, '_master_addr') and hasattr(self, '_master_port'):
+                            print(f"[INFO] Using previously stored master info: {self._master_addr}:{self._master_port}")
+                        else:
+                            # Otherwise, try to get the info directly from the first worker
+                            if len(self._workers) > 0:
+                                first_worker = self._workers[0]
+                                try:
+                                    # Assume the first worker has the master info
+                                    env_vars = ray.get(first_worker.get_env_vars.remote())
+                                    self._master_addr = env_vars.get('MASTER_ADDR')
+                                    self._master_port = env_vars.get('MASTER_PORT')
+                                    print(f"[INFO] Retrieved master info from first worker: {self._master_addr}:{self._master_port}")
+                                except Exception as e:
+                                    print(f"[ERROR] Failed to get env vars from first worker: {e}")
+                                    # Last resort, use the current node's IP and find a free port
+                                    self._master_addr = ray.util.get_node_ip_address()
+                                    self._master_port = str(find_free_port())
+                                    print(f"[INFO] Using fallback master info: {self._master_addr}:{self._master_port}")
+                    else:
+                        # Successfully found the register center, get the rank zero info
+                        try:
+                            rank_zero_info = ray.get(register_center_actor.get_rank_zero_info.remote())
+                            self._master_addr, self._master_port = rank_zero_info['MASTER_ADDR'], rank_zero_info['MASTER_PORT']
+                            print(f"[INFO] Got rank zero info from register center: {self._master_addr}:{self._master_port}")
+                        except Exception as e:
+                            print(f"[ERROR] Failed to get rank zero info from register center: {e}")
+                            # Fallback to using current node's IP and a free port
+                            self._master_addr = ray.util.get_node_ip_address()
+                            self._master_port = str(find_free_port())
+                            print(f"[INFO] Using fallback master info: {self._master_addr}:{self._master_port}")
 
     @property
     def worker_names(self):
@@ -463,5 +528,5 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
         _bind_workers_method_to_parent(WorkerDict, key, user_defined_cls)
 
     remote_cls = ray.remote(WorkerDict)
-    remote_cls = RayClassWithInitArgs(cls=remote_cls)
+    remote_cls = RayClassWithInitArgs(remote_cls)
     return remote_cls

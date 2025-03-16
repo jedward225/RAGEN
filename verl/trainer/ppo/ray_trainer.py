@@ -71,12 +71,12 @@ class ResourcePoolManager:
 
     def create_resource_pool(self):
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
-            # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
-            # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
-            # For Megatron backend, we recommend using max_colocate_count>1 that can utilize different WorkerGroup for differnt models
+            # max_collocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
+            # For FSDP backend, we recommend using max_collocate_count=1 that merge all WorkerGroups into one.
+            # For Megatron backend, we recommend using max_collocate_count>1 that can utilize different WorkerGroup for differnt models
             resource_pool = RayResourcePool(process_on_nodes=process_on_nodes,
                                             use_gpu=True,
-                                            max_colocate_count=1,
+                                            max_collocate_count=1,
                                             name_prefix=resource_pool_name)
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
@@ -539,12 +539,12 @@ class RayPPOTrainer(object):
             # Add to resource pool with proper key - use string key matching the role
             self.resource_pool_to_cls[resource_pool][Role.ActorRollout.name] = RayClassWithInitArgs(
                 self.role_worker_mapping[Role.ActorRollout],
-                kwargs={
-                    'config': actor_rollout_config,
-                    'tokenizer': self.tokenizer,
-                    'rollout_config': self.rollout_config,
-                    'role': Role.ActorRollout.name
-                }
+                kwargs=dict(
+                    config=actor_rollout_config,
+                    tokenizer=self.tokenizer,
+                    rollout_config=self.rollout_config,
+                    role=Role.ActorRollout.name
+                )
             )
             
             # If critic is needed, set it up similarly
@@ -557,11 +557,11 @@ class RayPPOTrainer(object):
                     resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
                     self.resource_pool_to_cls[resource_pool][Role.Critic.name] = RayClassWithInitArgs(
                         self.role_worker_mapping[Role.Critic],
-                        kwargs={
-                            'config': self.config.critic,
-                            'tokenizer': self.tokenizer,
-                            'role': Role.Critic.name
-                        }
+                        kwargs=dict(
+                            config=self.config.critic,
+                            tokenizer=self.tokenizer,
+                            role=Role.Critic.name
+                        )
                     )
                 
             # Set up reference policy if needed
@@ -574,11 +574,11 @@ class RayPPOTrainer(object):
                     resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
                     self.resource_pool_to_cls[resource_pool][Role.RefPolicy.name] = RayClassWithInitArgs(
                         self.role_worker_mapping[Role.RefPolicy],
-                        kwargs={
-                            'config': self.config.ref,
-                            'tokenizer': self.tokenizer,
-                            'role': Role.RefPolicy.name
-                        }
+                        kwargs=dict(
+                            config=self.config.ref,
+                            tokenizer=self.tokenizer,
+                            role=Role.RefPolicy.name
+                        )
                     )
                 
             # Set up reward model if needed
@@ -591,11 +591,11 @@ class RayPPOTrainer(object):
                     resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
                     self.resource_pool_to_cls[resource_pool][Role.RewardModel.name] = RayClassWithInitArgs(
                         self.role_worker_mapping[Role.RewardModel],
-                        kwargs={
-                            'config': self.config.rm,
-                            'tokenizer': self.tokenizer,
-                            'role': Role.RewardModel.name
-                        }
+                        kwargs=dict(
+                            config=self.config.rm,
+                            tokenizer=self.tokenizer,
+                            role=Role.RewardModel.name
+                        )
                     )
             
         else:
