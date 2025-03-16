@@ -352,7 +352,7 @@ class RayPPOTrainer(object):
         if val_env is not None:
             print("[INFO] val env is different from train env, it means you are evaluating the model's generalization capabilities.")
 
-        self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
+        self.hybrid_engine = config.get('actor_rollout_ref', {}).get('hybrid_engine', False)
         assert self.hybrid_engine, 'Currently, only support hybrid engine'
 
         if self.hybrid_engine:
@@ -368,9 +368,9 @@ class RayPPOTrainer(object):
 
         # define KL control
         if self.use_reference_policy:
-            if config.algorithm.kl_ctrl.type == 'fixed':
+            if config.algorithm.get('kl_ctrl', {}).get('type') == 'fixed':
                 self.kl_ctrl = core_algos.FixedKLController(kl_coef=config.algorithm.kl_ctrl.kl_coef)
-            elif config.algorithm.kl_ctrl.type == 'adaptive':
+            elif config.algorithm.get('kl_ctrl', {}).get('type') == 'adaptive':
                 assert config.algorithm.kl_ctrl.horizon > 0, f'horizon must be larger than 0. Got {config.critic.kl_ctrl.horizon}'
                 self.kl_ctrl = core_algos.AdaptiveKLController(init_kl_coef=config.algorithm.kl_ctrl.kl_coef,
                                                                target_kl=config.algorithm.kl_ctrl.target_kl,
@@ -401,7 +401,7 @@ class RayPPOTrainer(object):
                                          filter_prompts=True,
                                          return_raw_chat=self.config.data.get('return_raw_chat', False),
                                          truncation='error')
-        if self.config.data.train_data_num is not None:
+        if self.config.data.get('train_data_num') is not None:
             if self.config.data.train_data_num > len(self.train_dataset.dataframe):
                 print(f"[WARNING] training dataset size is smaller than desired size. Using the dataset as the original size {len(self.train_dataset.dataframe)}")
             else:
@@ -421,7 +421,7 @@ class RayPPOTrainer(object):
                                        filter_prompts=True,
                                        return_raw_chat=self.config.data.get('return_raw_chat', False),
                                        truncation='error')
-        if self.config.data.val_data_num is not None:
+        if self.config.data.get('val_data_num') is not None:
             if self.config.data.val_data_num > len(self.val_dataset.dataframe):
                 print(f"[WARNING] validation dataset size is smaller than desired size. Using the dataset as the original size {len(self.val_dataset.dataframe)}")
             else:
@@ -441,9 +441,9 @@ class RayPPOTrainer(object):
         assert len(self.val_dataloader) >= 1
 
         # inject total_training_steps to actor/critic optim_config. This is hacky.
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        total_training_steps = len(self.train_dataloader) * self.config.trainer.get('total_epochs', 1)
 
-        if self.config.trainer.total_training_steps is not None:
+        if self.config.trainer.get('total_training_steps') is not None:
             total_training_steps = self.config.trainer.total_training_steps
 
         self.total_training_steps = total_training_steps
@@ -468,20 +468,47 @@ class RayPPOTrainer(object):
             self.rollout_config.training = OmegaConf.create()
             self.rollout_config.training.stop_token = self.tokenizer.eos_token_id
             self.rollout_config.training.pad_token = self.tokenizer.pad_token_id
-            self.rollout_config.training.min_length = self.config.data.min_response_length if hasattr(self.config.data, 'min_response_length') else 0
-            self.rollout_config.training.max_length = self.config.data.max_response_length
-            # Access temperature directly from the config rather than config.training
-            self.rollout_config.training.temperature = self.config.training.temperature if hasattr(self.config.training, 'temperature') else 0.7
+            
+            # Access data attributes safely
+            min_response_length = 0
+            if hasattr(self.config, 'data') and hasattr(self.config.data, 'min_response_length'):
+                min_response_length = self.config.data.min_response_length
+            self.rollout_config.training.min_length = min_response_length
+            
+            max_length = 400  # Default value
+            if hasattr(self.config, 'data') and hasattr(self.config.data, 'max_response_length'):
+                max_length = self.config.data.max_response_length
+            self.rollout_config.training.max_length = max_length
+            
+            # Use default values and get temperature from rollout config if available
+            temperature_value = 0.7
+            if hasattr(self.config, 'actor_rollout_ref') and hasattr(self.config.actor_rollout_ref, 'rollout') and hasattr(self.config.actor_rollout_ref.rollout, 'temperature'):
+                temperature_value = self.config.actor_rollout_ref.rollout.temperature
+            self.rollout_config.training.temperature = temperature_value
+            
             self.rollout_config.training.num_return_sequences = 1
-            self.rollout_config.training.max_obs_length = self.config.data.max_obs_length
-            # Access binary_reward and length_penalty directly from the config
-            self.rollout_config.training.binary_reward = self.config.training.binary_reward if hasattr(self.config.training, 'binary_reward') else False
-            self.rollout_config.training.length_penalty = self.config.training.length_penalty if hasattr(self.config.training, 'length_penalty') else False
+            
+            # Access max_obs_length safely
+            max_obs_length = 200  # Default value
+            if hasattr(self.config, 'data') and hasattr(self.config.data, 'max_obs_length'):
+                max_obs_length = self.config.data.max_obs_length
+            self.rollout_config.training.max_obs_length = max_obs_length
+            
+            # Use default values for binary_reward and length_penalty
+            binary_reward_value = False
+            length_penalty_value = False
+            if hasattr(self.config, 'algorithm'):
+                if hasattr(self.config.algorithm, 'binary_reward'):
+                    binary_reward_value = self.config.algorithm.binary_reward
+                if hasattr(self.config.algorithm, 'length_penalty'):
+                    length_penalty_value = self.config.algorithm.length_penalty
+            self.rollout_config.training.binary_reward = binary_reward_value
+            self.rollout_config.training.length_penalty = length_penalty_value
             
             # Add precision settings for Flash Attention compatibility
             self.rollout_config.training.torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             self.rollout_config.training.attn_implementation = "flash_attention_2"
-
+            
         if self.hybrid_engine:
             # create actor_rollout class for the hybrid engine
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
@@ -499,7 +526,7 @@ class RayPPOTrainer(object):
             raise NotImplementedError
 
         # create critic
-        if self.config.algorithm.adv_estimator == 'gae':
+        if self.config.algorithm.get('adv_estimator') == 'gae':
             print("[DEBUG] GAE is used")
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
             
@@ -513,7 +540,7 @@ class RayPPOTrainer(object):
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
             self.use_critic = True
             
-        elif self.config.algorithm.adv_estimator in ['grpo', 'brpo', 'arpo']:
+        elif self.config.algorithm.get('adv_estimator') in ['grpo', 'brpo', 'arpo']:
             print("[DEBUG] GRPO is used")
             self.use_critic = False   # use a first-step reference model instead, and use the "low_var_kl" instead
         else:
@@ -607,9 +634,9 @@ class RayPPOTrainer(object):
         batch_size = sequence_lengths.size(0)
 
         # Check if we are using model parallel
-        if self.config.actor_rollout_ref.actor.world_size > 1:
+        if self.config.actor_rollout_ref.actor.get('world_size', 1) > 1:
             # Get the number of dp ranks
-            dp_world_size = self.config.actor_rollout_ref.actor.dp_world_size
+            dp_world_size = self.config.actor_rollout_ref.actor.get('dp_world_size', 1)
 
             # Get balanced partitions based on sequence lengths
             reorder_idxs, partition_stats = get_seqlen_balanced_partitions(
@@ -660,17 +687,17 @@ class RayPPOTrainer(object):
 
         # Agent config preparation
         gen_config = GenerationConfig(
-            max_turns=self.config.max_turns,
+            max_turns=self.config.get('max_turns', 1),
             max_start_length=self.config.data.max_start_length,
             max_prompt_length=self.config.data.max_prompt_length,
             max_response_length=self.config.data.max_response_length,
             max_obs_length=self.config.data.max_obs_length,
             logging=self.config.logging,
             num_gpus=self.config.trainer.n_gpus_per_node,
-            no_think_rl=self.config.algorithm.no_think_rl,
-            state_masking=self.config.actor_rollout_ref.actor.state_masking,
-            start_state_marker=self.config.algorithm.state_masking.start_state_marker,
-            end_state_marker=self.config.algorithm.state_masking.end_state_marker,
+            no_think_rl=self.config.algorithm.get('no_think_rl', False),
+            state_masking=self.config.actor_rollout_ref.actor.get('state_masking', False),
+            start_state_marker=self.config.algorithm.state_masking.get('start_state_marker', ''),
+            end_state_marker=self.config.algorithm.state_masking.get('end_state_marker', ''),
         )
 
         generation_manager = LLMGenerationManager(
@@ -686,12 +713,12 @@ class RayPPOTrainer(object):
 
 
         # start training loop
-        for epoch in range(self.config.trainer.total_epochs):
+        for epoch in range(self.config.trainer.get('total_epochs', 1)):
             for batch_dict in self.train_dataloader:
                 print(f'epoch {epoch}, step {self.global_steps}')
 
                 # update ref_policy_wg
-                if self.config.trainer.ref_update_steps is not None and self.global_steps % self.config.trainer.ref_update_steps == 0:
+                if self.config.trainer.get('ref_update_steps') is not None and self.global_steps % self.config.trainer.ref_update_steps == 0:
                     self.actor_rollout_wg.save_checkpoint(
                         local_path=f'./log/temp/actor_rollout_wg_global_step_{self.global_steps}',
                         hdfs_path=None
@@ -766,11 +793,11 @@ class RayPPOTrainer(object):
                         output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
                         final_gen_batch_output = final_gen_batch_output.union(output)
                     
-                    if self.config.algorithm.adv_estimator == 'grpo': # NOTE we currently use seed to group, better use prompt (hash) to group
+                    if self.config.algorithm.get('adv_estimator') == 'grpo': # NOTE we currently use seed to group, better use prompt (hash) to group
                         batch.non_tensor_batch['uid'] = np.array([str(i) for i in env_seeds], dtype=object)
-                    elif self.config.algorithm.adv_estimator == 'brpo':
+                    elif self.config.algorithm.get('adv_estimator') == 'brpo':
                         batch.non_tensor_batch['uid'] = np.array(["" for _ in range(len(batch.batch))], dtype=object)
-                    elif self.config.algorithm.adv_estimator == 'arpo':
+                    elif self.config.algorithm.get('adv_estimator') == 'arpo':
                         batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object) # No Relative normalization
 
                     # reward
@@ -842,19 +869,19 @@ class RayPPOTrainer(object):
                         batch.batch['token_level_scores'] = reward_tensor
 
                         # compute rewards. apply_kl_penalty if available, no kl_loss or kl_penalty for GAE
-                        if not self.config.actor_rollout_ref.actor.use_kl_loss or self.config.algorithm.adv_estimator != 'gae':
+                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False) or self.config.algorithm.get('adv_estimator') != 'gae':
                             batch, kl_metrics = apply_kl_penalty(batch,
                                                                  kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
+                                                                 kl_penalty=self.config.algorithm.get('kl_penalty', 'kl'))
                             metrics.update(kl_metrics)
                         else:
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
+                                                  adv_estimator=self.config.algorithm.get('adv_estimator', 'gae'),
+                                                  gamma=self.config.algorithm.get('gamma', 1.0),
+                                                  lam=self.config.algorithm.get('lam', 1.0),
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
 
                     # update critic
@@ -865,22 +892,22 @@ class RayPPOTrainer(object):
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+                    if self.config.trainer.get('critic_warmup') is not None and self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
-                            if self.config.actor_rollout_ref.actor.state_masking:
+                            if self.config.actor_rollout_ref.actor.get('state_masking', False):
                                 batch,metrics = self._create_loss_mask(batch, metrics)
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
 
                     # validate
-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
+                    if self.val_reward_fn is not None and self.config.trainer.get('test_freq') > 0 and \
                         self.global_steps % self.config.trainer.test_freq == 0:
                         with _timer('testing', timing_raw):
                             val_metrics: dict = self._validate()
 
-                    if self.config.trainer.save_freq > 0 and \
+                    if self.config.trainer.get('save_freq') > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
@@ -919,8 +946,8 @@ class RayPPOTrainer(object):
 
         for i, response in enumerate(responses):
             # Find all pairs of start and end marker positions
-            start_marker = self.config.algorithm.state_masking.start_state_marker
-            end_marker = self.config.algorithm.state_masking.end_state_marker   
+            start_marker = self.config.algorithm.state_masking.get('start_state_marker', '')
+            end_marker = self.config.algorithm.state_masking.get('end_state_marker', '')   
             
             # Get all start and end positions
             start_positions = [m.start() for m in re.finditer(re.escape(start_marker), response)]
@@ -979,17 +1006,17 @@ class RayPPOTrainer(object):
         self.val_num += 1
 
         gen_config = GenerationConfig(
-            max_turns=self.config.max_turns,
+            max_turns=self.config.get('max_turns', 1),
             max_start_length=self.config.data.max_start_length,
             max_prompt_length=self.config.data.max_prompt_length,
             max_response_length=self.config.data.max_response_length,
             max_obs_length=self.config.data.max_obs_length,
             logging=self.config.logging,
             num_gpus=self.config.trainer.n_gpus_per_node,
-            no_think_rl=self.config.algorithm.no_think_rl,
-            state_masking=self.config.actor_rollout_ref.actor.state_masking,
-            start_state_marker=self.config.algorithm.state_masking.start_state_marker,
-            end_state_marker=self.config.algorithm.state_masking.end_state_marker,
+            no_think_rl=self.config.algorithm.get('no_think_rl', False),
+            state_masking=self.config.actor_rollout_ref.actor.get('state_masking', False),
+            start_state_marker=self.config.algorithm.state_masking.get('start_state_marker', ''),
+            end_state_marker=self.config.algorithm.state_masking.get('end_state_marker', ''),
         )
 
         # Agent config preparation
