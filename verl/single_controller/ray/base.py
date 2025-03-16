@@ -13,30 +13,56 @@
 # limitations under the License.
 
 import time
-from typing import Dict, List, Any, Tuple
 import ray
+import traceback
+from typing import Any, List, Union, Dict, Optional
 from ray.util import list_named_actors
 from ray.util.placement_group import placement_group, PlacementGroup
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy, NodeAffinitySchedulingStrategy
-from ray.experimental.state.api import get_actor
-
-from verl.single_controller.base import WorkerGroup, ResourcePool, ClassWithInitArgs, Worker
+from time import sleep
+from verl.single_controller.base.worker_group import ResourcePool, ClassWithInitArgs
+from ray import tune
+from ray.runtime_context import get_runtime_context
+from verl.single_controller.base.decorator import Dispatch, MAGIC_ATTR
 
 __all__ = ['Worker']
 
 import socket
 
-def find_free_port():
-    """Find a free port on the current node."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', 0))
-        return s.getsockname()[1]
+def _default_generate_function(worker_group, method_name, dispatch_mode):
+    """Default function generator for worker methods"""
+    from verl.single_controller.base.decorator import dispatch_one_to_all, dispatch_all_to_all, collect_all_to_all
 
-def get_random_string(length: int) -> str:
-    import random
-    import string
-    letters_digits = string.ascii_letters + string.digits
-    return ''.join(random.choice(letters_digits) for _ in range(length))
+    # Define dispatch function based on mode
+    if dispatch_mode == Dispatch.RANK_ZERO:
+        def dispatch_fn(self, *args, **kwargs):
+            return args, kwargs
+    elif dispatch_mode == Dispatch.ONE_TO_ALL:
+        def dispatch_fn(self, *args, **kwargs):
+            return dispatch_one_to_all(self, *args, **kwargs)
+    elif dispatch_mode == Dispatch.ALL_TO_ALL:
+        def dispatch_fn(self, *args, **kwargs):
+            return dispatch_all_to_all(self, *args, **kwargs)
+    else:
+        raise ValueError(f"Unsupported dispatch mode: {dispatch_mode}")
+
+    # Define execute function based on mode
+    if dispatch_mode == Dispatch.RANK_ZERO:
+        def execute_fn(method_name, *args, **kwargs):
+            return worker_group.execute_rank_zero(method_name, *args, **kwargs)
+    else:
+        def execute_fn(method_name, *args, **kwargs):
+            return worker_group.execute_all(method_name, *args, **kwargs)
+
+    # Define collect function based on mode
+    if dispatch_mode == Dispatch.RANK_ZERO:
+        def collect_fn(output):
+            return output
+    else:
+        def collect_fn(output):
+            return collect_all_to_all(worker_group, output)
+
+    # Use func_generator to create the function
+    return func_generator(worker_group, method_name, dispatch_fn, collect_fn, execute_fn, True)
 
 
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
@@ -46,10 +72,37 @@ def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, block
         output = execute_fn(method_name, *args, **kwargs)
         if blocking:
             output = ray.get(output)
-        output = collect_fn(self, output)
-        return output
+        return collect_fn(output)
 
     return func
+
+
+def find_free_port():
+    """Find a free port on the current node."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+
+def get_random_string(length: int) -> str:
+    import random
+    import string
+    letters_digits = string.ascii_letters + string.digits
+    return ''.join(random.choice(letters_digits) for _ in range(length))
+
+
+def merge_resource_pool(rp1: RayResourcePool, rp2: RayResourcePool) -> RayResourcePool:
+    assert rp1.use_gpu == rp2.use_gpu, 'Both RayResourcePool must either use_gpu or not'
+    assert rp1.max_collocate_count == rp2.max_collocate_count, 'Both RayResourcePool must has the same max_collocate_count'
+    assert rp1.n_gpus_per_node == rp2.n_gpus_per_node, 'Both RayResourcePool must has the same n_gpus_per_node'
+    assert rp1.detached == rp2.detached, 'Detached ResourcePool cannot be merged with non-detached ResourcePool'
+
+    new_store = rp1.store + rp2.store
+
+    merged = RayResourcePool(new_store, rp1.use_gpu, f"{rp1.name_prefix}_{rp2.name_prefix}")
+    merged.pgs = rp1.get_placement_groups() + rp2.get_placement_groups()
+
+    return merged
 
 
 class RayResourcePool(ResourcePool):
@@ -115,20 +168,6 @@ def extract_pg_from_exist(resource_pools: Dict[str, RayResourcePool], src_role_n
         searching_idx += 1
 
     return [pg for _, pg in sorted(unsorted_pgs)]
-
-
-def merge_resource_pool(rp1: RayResourcePool, rp2: RayResourcePool) -> RayResourcePool:
-    assert rp1.use_gpu == rp2.use_gpu, 'Both RayResourcePool must either use_gpu or not'
-    assert rp1.max_collocate_count == rp2.max_collocate_count, 'Both RayResourcePool must has the same max_collocate_count'
-    assert rp1.n_gpus_per_node == rp2.n_gpus_per_node, 'Both RayResourcePool must has the same n_gpus_per_node'
-    assert rp1.detached == rp2.detached, 'Detached ResourcePool cannot be merged with non-detached ResourcePool'
-
-    new_store = rp1.store + rp2.store
-
-    merged = RayResourcePool(new_store, rp1.use_gpu, f"{rp1.name_prefix}_{rp2.name_prefix}")
-    merged.pgs = rp1.get_placement_groups() + rp2.get_placement_groups()
-
-    return merged
 
 
 class RayClassWithInitArgs(ClassWithInitArgs):
