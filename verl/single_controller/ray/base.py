@@ -15,23 +15,25 @@
 import time
 import ray
 import traceback
-from typing import Any, List, Union, Dict, Optional
+import socket
+import os
+from typing import Any, List, Union, Dict, Optional, Tuple, TYPE_CHECKING
 from ray.util import list_named_actors
-from ray.util.placement_group import placement_group, PlacementGroup
+from ray.util.placement_group import placement_group, PlacementGroup, remove_placement_group
 from time import sleep
-from verl.single_controller.base.worker_group import ResourcePool, ClassWithInitArgs
 from ray import tune
 from ray.runtime_context import get_runtime_context
+from ray.experimental.state.api import get_actor
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy, NodeAffinitySchedulingStrategy
+from verl.single_controller.base.worker_group import ResourcePool, ClassWithInitArgs, WorkerGroup
 from verl.single_controller.base.decorator import Dispatch, MAGIC_ATTR
+from unittest.mock import patch
+from verl.single_controller.base.decorator import dispatch_one_to_all, dispatch_all_to_all, collect_all_to_all
 
-__all__ = ['Worker']
-
-import socket
+__all__ = ['Worker', 'RayResourcePool', 'RayClassWithInitArgs', 'RayWorkerGroup', 'create_colocated_worker_cls']
 
 def _default_generate_function(worker_group, method_name, dispatch_mode):
     """Default function generator for worker methods"""
-    from verl.single_controller.base.decorator import dispatch_one_to_all, dispatch_all_to_all, collect_all_to_all
-
     # Define dispatch function based on mode
     if dispatch_mode == Dispatch.RANK_ZERO:
         def dispatch_fn(self, *args, **kwargs):
@@ -66,13 +68,14 @@ def _default_generate_function(worker_group, method_name, dispatch_mode):
 
 
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
+    """Generate a function that dispatches and executes a remote task."""
 
     def func(*args, **kwargs):
         args, kwargs = dispatch_fn(self, *args, **kwargs)
         output = execute_fn(method_name, *args, **kwargs)
         if blocking:
             output = ray.get(output)
-        return collect_fn(output)
+        return collect_fn(output)  # Pass output directly to collect_fn
 
     return func
 
@@ -91,21 +94,10 @@ def get_random_string(length: int) -> str:
     return ''.join(random.choice(letters_digits) for _ in range(length))
 
 
-def merge_resource_pool(rp1: RayResourcePool, rp2: RayResourcePool) -> RayResourcePool:
-    assert rp1.use_gpu == rp2.use_gpu, 'Both RayResourcePool must either use_gpu or not'
-    assert rp1.max_collocate_count == rp2.max_collocate_count, 'Both RayResourcePool must has the same max_collocate_count'
-    assert rp1.n_gpus_per_node == rp2.n_gpus_per_node, 'Both RayResourcePool must has the same n_gpus_per_node'
-    assert rp1.detached == rp2.detached, 'Detached ResourcePool cannot be merged with non-detached ResourcePool'
-
-    new_store = rp1.store + rp2.store
-
-    merged = RayResourcePool(new_store, rp1.use_gpu, f"{rp1.name_prefix}_{rp2.name_prefix}")
-    merged.pgs = rp1.get_placement_groups() + rp2.get_placement_groups()
-
-    return merged
-
-
 class RayResourcePool(ResourcePool):
+    """
+    Mimic multi-processing resource, but for ray. Maps to a ray placement group
+    """
 
     def __init__(self,
                  process_on_nodes: List[int] = None,
@@ -145,6 +137,20 @@ class RayResourcePool(ResourcePool):
 
         self.pgs = pgs
         return pgs
+
+
+def merge_resource_pool(rp1: RayResourcePool, rp2: RayResourcePool) -> RayResourcePool:
+    assert rp1.use_gpu == rp2.use_gpu, 'Both RayResourcePool must either use_gpu or not'
+    assert rp1.max_collocate_count == rp2.max_collocate_count, 'Both RayResourcePool must has the same max_collocate_count'
+    assert rp1.n_gpus_per_node == rp2.n_gpus_per_node, 'Both RayResourcePool must has the same n_gpus_per_node'
+    assert rp1.detached == rp2.detached, 'Detached ResourcePool cannot be merged with non-detached ResourcePool'
+
+    new_store = rp1.store + rp2.store
+
+    merged = RayResourcePool(new_store, rp1.use_gpu, f"{rp1.name_prefix}_{rp2.name_prefix}")
+    merged.pgs = rp1.get_placement_groups() + rp2.get_placement_groups()
+
+    return merged
 
 
 def extract_pg_from_exist(resource_pools: Dict[str, RayResourcePool], src_role_names: List[str],
@@ -484,9 +490,8 @@ Utilities that enables creating workers inside the same ray.Actor,
 with code written in separate ray.Actors.
 """
 
-from unittest.mock import patch
+# Import here instead of the top to avoid circular dependencies
 from verl.single_controller.base.decorator import MAGIC_ATTR
-import os
 
 
 def _bind_workers_method_to_parent(cls, key, user_defined_cls):
