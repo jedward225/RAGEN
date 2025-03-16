@@ -281,14 +281,6 @@ class RayWorkerGroup(WorkerGroup):
     def worker_names(self):
         return self._worker_names
 
-    @classmethod
-    def from_detached(cls, worker_names=None, ray_cls_with_init=None):
-        worker_group = cls(resource_pool=None,
-                           ray_cls_with_init=ray_cls_with_init,
-                           name_prefix=None,
-                           worker_names=worker_names)
-        return worker_group
-
     def spawn(self, prefix_set):
         """
         spawn to a dictionary of worker groups, each with a subset of method with prefix.
@@ -365,6 +357,76 @@ class RayWorkerGroup(WorkerGroup):
     @property
     def world_size(self):
         return self._world_size
+
+    def _bind_worker_method(self, user_defined_cls, func_generator):
+        """Bind worker methods to the worker group so they can be called directly on the worker group."""
+        # Make sure we're working with the actual class, not a Ray-wrapped class
+        user_defined_cls = _unwrap_ray_remote(user_defined_cls)
+        
+        # List of common method names that we should explicitly check for and bind
+        common_methods = [
+            'generate_sequences', 'compute_log_prob', 'compute_ref_log_prob',
+            'compute_values', 'update_actor', 'update_critic', 'compute_rm_score',
+            'save_checkpoint', 'load_model_parameters'
+        ]
+        
+        # First pass: check for explicitly defined methods we know are needed
+        for method_name in common_methods:
+            if hasattr(user_defined_cls, method_name):
+                # Define a wrapper that calls the method remotely and gets the result
+                def make_wrapper(method):
+                    def wrapper(self, *args, **kwargs):
+                        if not hasattr(self, '_workers') or len(self._workers) == 0:
+                            raise RuntimeError(f"No workers available in worker group for {method}")
+                            
+                        futures = [worker.getattr(method).remote(*args, **kwargs) 
+                                  for worker in self._workers]
+                        return ray.get(futures[0]) if len(futures) == 1 else ray.get(futures)
+                    
+                    # Copy any attributes from the original method
+                    for attr_name in dir(getattr(user_defined_cls, method_name)):
+                        if not attr_name.startswith('__'):
+                            try:
+                                setattr(wrapper, attr_name, 
+                                       getattr(getattr(user_defined_cls, method_name), attr_name))
+                            except AttributeError:
+                                pass
+                                
+                    return wrapper
+                
+                # Bind the method to this instance
+                method_wrapper = make_wrapper(method_name)
+                setattr(self.__class__, method_name, method_wrapper)
+                print(f"Explicitly bound method {method_name} to worker group")
+        
+        # Second pass: go through all attributes in the class to find other relevant methods
+        for method_name in dir(user_defined_cls):
+            method = getattr(user_defined_cls, method_name)
+            if callable(method) and not method_name.startswith('__'):
+                # Define a wrapper that calls the method remotely and gets the result
+                def make_wrapper(method):
+                    def wrapper(self, *args, **kwargs):
+                        if not hasattr(self, '_workers') or len(self._workers) == 0:
+                            raise RuntimeError(f"No workers available in worker group for {method}")
+                            
+                        futures = [worker.getattr(method).remote(*args, **kwargs) 
+                                  for worker in self._workers]
+                        return ray.get(futures[0]) if len(futures) == 1 else ray.get(futures)
+                    
+                    # Copy any attributes from the original method
+                    for attr_name in dir(method):
+                        if not attr_name.startswith('__'):
+                            try:
+                                setattr(wrapper, attr_name, getattr(method, attr_name))
+                            except AttributeError:
+                                pass
+                                
+                    return wrapper
+                
+                # Bind the method to this instance
+                method_wrapper = make_wrapper(method)
+                setattr(self.__class__, method_name, method_wrapper)
+                print(f"Bound method {method_name} to worker group")
 
 
 """

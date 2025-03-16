@@ -516,10 +516,42 @@ class RayPPOTrainer(object):
                 self.rollout_config.training.attn_implementation = "eager"
                 print("[WARNING] CUDA is not available, using CPU-compatible settings.")
             
+        # Explicitly define which methods should be exposed to Ray remote call system
+        # This makes sure these methods get properly registered with Ray
+        actor_rollout_methods = [
+            'generate_sequences', 'compute_log_prob', 'compute_ref_log_prob', 
+            'compute_values', 'update_actor', 'update_critic', 'compute_rm_score',
+            'save_checkpoint', 'load_model_parameters'
+        ]
+        
+        # Create modified Ray actor class that explicitly includes the methods
+        from verl.workers.fsdp_workers import ActorRolloutRefWorker
+        
+        # Use the original actor class to make a new one with explicit method registration
+        import types
+        import inspect
+        
+        # Create a dict of the methods we want to explicitly include
+        actor_methods = {}
+        for method_name in actor_rollout_methods:
+            if hasattr(ActorRolloutRefWorker, method_name):
+                method = getattr(ActorRolloutRefWorker, method_name)
+                actor_methods[method_name] = method
+        
+        # Create a new class with the methods explicitly included
+        ActorRolloutWithMethods = type('ActorRolloutWithMethods', (ActorRolloutRefWorker,), actor_methods)
+        
+        # Register this new class with Ray
+        import ray
+        ActorRolloutRayClass = ray.remote(ActorRolloutWithMethods)
+        
+        # Store this class for later use
+        actor_rollout_cls = ActorRolloutRayClass
+        
         if self.hybrid_engine:
             # create actor_rollout class for the hybrid engine
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
-            
+
             # Add Flash Attention configuration to actor_rollout
             actor_rollout_config = self.config.actor_rollout_ref.copy()
             
@@ -534,8 +566,11 @@ class RayPPOTrainer(object):
                 actor_rollout_config.model.attn_implementation = self.rollout_config.training.attn_implementation
             
             actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.ActorRollout],
-                                                   config=actor_rollout_config,
-                                                   role='actor_rollout')
+                                                   args=(),
+                                                   kwargs={'config': actor_rollout_config,
+                                                          'tokenizer': self.tokenizer,
+                                                          'rollout_config': self.rollout_config,
+                                                          'role': 'actor_rollout'})
             self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
         else:
             raise NotImplementedError
@@ -635,45 +670,73 @@ class RayPPOTrainer(object):
         # create worker shortcuts
         if self.hybrid_engine:
             self.actor_rollout_wg = all_wg['actor_rollout']
-            
-            # Import Ray first to ensure we have access to it
-            import ray
-            
-            # First check if the worker even exists in _workers
-            if hasattr(self.actor_rollout_wg, '_workers') and len(self.actor_rollout_wg._workers) > 0:
-                # Use Ray's introspection to get the available methods on the remote actor
-                worker_ref = self.actor_rollout_wg._workers[0]
-                
-                # Register the methods directly on the worker group
-                def create_proxy_method(method_name):
-                    def proxy_method(*args, **kwargs):
-                        # Get a future from the remote method call
-                        ref = getattr(worker_ref, method_name).remote(*args, **kwargs)
-                        # Wait for the result and return it
-                        return ray.get(ref)
-                    return proxy_method
-                
-                # Methods that need to be available on the worker group
-                required_methods = [
-                    'generate_sequences',
-                    'compute_log_prob',
-                    'compute_ref_log_prob',
-                    'update_actor',
-                    'save_checkpoint',
-                    'load_model_parameters',
-                    'compute_values',
-                    'update_critic',
-                    'compute_rm_score'
-                ]
-                
-                # Create proxies for all required methods
-                for method_name in required_methods:
-                    setattr(self.actor_rollout_wg, method_name, create_proxy_method(method_name))
-                    print(f"[INFO] Registered proxy method '{method_name}' on actor_rollout_wg")
-            else:
-                print("[ERROR] Cannot access worker methods: No workers found in the worker group")
         else:
             raise NotImplementedError
+
+        if self.use_critic:
+            self.critic_wg = all_wg['critic']
+            
+        if self.use_reference_policy:
+            self.ref_wg = all_wg['ref']
+            
+        if self.use_rm:
+            self.rm_wg = all_wg['rm']
+            
+        # Direct fix for the worker method issue
+        # The issue is that the worker methods aren't properly exposed through Ray
+        # This modification explicitly forwards important methods to the actual worker instance
+        if hasattr(self, 'actor_rollout_wg') and hasattr(self.actor_rollout_wg, '_workers') and len(self.actor_rollout_wg._workers) > 0:
+            import ray
+            import types
+            
+            # Define a method to generate a wrapper function that calls the remote worker's method
+            def create_worker_method_wrapper(worker_group, method_name):
+                def wrapper(*args, **kwargs):
+                    # Get the first worker
+                    worker = worker_group._workers[0]
+                    # Call the method remotely
+                    try:
+                        result_ref = getattr(worker, method_name).remote(*args, **kwargs)
+                        # Get and return the result
+                        return ray.get(result_ref)
+                    except AttributeError:
+                        print(f"[ERROR] Worker doesn't have method '{method_name}'")
+                        print(f"[DEBUG] Available methods: {dir(worker)}")
+                        raise
+                return wrapper
+            
+            # List of important methods that need direct access
+            key_methods = [
+                'generate_sequences',
+                'compute_log_prob',
+                'compute_ref_log_prob',
+                'compute_values',
+                'update_actor',
+                'update_critic',
+                'compute_rm_score',
+                'save_checkpoint',
+                'load_model_parameters'
+            ]
+            
+            # Create wrapper methods for each worker group
+            worker_groups = []
+            if hasattr(self, 'actor_rollout_wg'):
+                worker_groups.append(('actor_rollout_wg', self.actor_rollout_wg))
+            if hasattr(self, 'critic_wg'):
+                worker_groups.append(('critic_wg', self.critic_wg))
+            if hasattr(self, 'ref_wg'):
+                worker_groups.append(('ref_wg', self.ref_wg))
+            if hasattr(self, 'rm_wg'):
+                worker_groups.append(('rm_wg', self.rm_wg))
+                
+            # Add method wrappers to all worker groups
+            for group_name, group in worker_groups:
+                for method_name in key_methods:
+                    # Only add methods if they don't already exist
+                    if not hasattr(group, method_name):
+                        wrapper = create_worker_method_wrapper(group, method_name)
+                        setattr(group, method_name, types.MethodType(wrapper, group))
+                        print(f"[INFO] Added '{method_name}' method to {group_name}")
 
     def _save_checkpoint(self):
         actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
