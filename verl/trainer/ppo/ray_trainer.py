@@ -636,98 +636,42 @@ class RayPPOTrainer(object):
         if self.hybrid_engine:
             self.actor_rollout_wg = all_wg['actor_rollout']
             
-            # Monkey patch the specific worker group instance with the needed methods
-            # This is a more direct approach than modifying the class
-            if not hasattr(self.actor_rollout_wg, 'generate_sequences'):
-                def generate_sequences(self_wg, prompts, **kwargs):
-                    """Forward generate_sequences to the first worker and wait for result"""
-                    ref = self_wg._workers[0].generate_sequences.remote(prompts, **kwargs)
-                    return ray.get(ref)
-                
-                # Bind the method directly to this instance
-                import types
-                self.actor_rollout_wg.generate_sequences = types.MethodType(generate_sequences, self.actor_rollout_wg)
-                print("[INFO] Added generate_sequences method to actor_rollout worker group")
+            # Import Ray first to ensure we have access to it
+            import ray
             
-            # Add compute_log_prob method
-            if not hasattr(self.actor_rollout_wg, 'compute_log_prob'):
-                def compute_log_prob(self_wg, batch, **kwargs):
-                    """Forward compute_log_prob to the first worker and wait for result"""
-                    ref = self_wg._workers[0].compute_log_prob.remote(batch, **kwargs)
-                    return ray.get(ref)
+            # First check if the worker even exists in _workers
+            if hasattr(self.actor_rollout_wg, '_workers') and len(self.actor_rollout_wg._workers) > 0:
+                # Use Ray's introspection to get the available methods on the remote actor
+                worker_ref = self.actor_rollout_wg._workers[0]
                 
-                self.actor_rollout_wg.compute_log_prob = types.MethodType(compute_log_prob, self.actor_rollout_wg)
-                print("[INFO] Added compute_log_prob method to actor_rollout worker group")
-            
-            # Add compute_ref_log_prob method if reference policy is used
-            if self.use_reference_policy and not hasattr(self.actor_rollout_wg, 'compute_ref_log_prob'):
-                def compute_ref_log_prob(self_wg, batch, **kwargs):
-                    """Forward compute_ref_log_prob to the first worker and wait for result"""
-                    ref = self_wg._workers[0].compute_ref_log_prob.remote(batch, **kwargs)
-                    return ray.get(ref)
+                # Register the methods directly on the worker group
+                def create_proxy_method(method_name):
+                    def proxy_method(*args, **kwargs):
+                        # Get a future from the remote method call
+                        ref = getattr(worker_ref, method_name).remote(*args, **kwargs)
+                        # Wait for the result and return it
+                        return ray.get(ref)
+                    return proxy_method
                 
-                self.actor_rollout_wg.compute_ref_log_prob = types.MethodType(compute_ref_log_prob, self.actor_rollout_wg)
-                print("[INFO] Added compute_ref_log_prob method to actor_rollout worker group")
-            
-            # Add update_actor method
-            if not hasattr(self.actor_rollout_wg, 'update_actor'):
-                def update_actor(self_wg, batch, **kwargs):
-                    """Forward update_actor to the first worker and wait for result"""
-                    ref = self_wg._workers[0].update_actor.remote(batch, **kwargs)
-                    return ray.get(ref)
+                # Methods that need to be available on the worker group
+                required_methods = [
+                    'generate_sequences',
+                    'compute_log_prob',
+                    'compute_ref_log_prob',
+                    'update_actor',
+                    'save_checkpoint',
+                    'load_model_parameters',
+                    'compute_values',
+                    'update_critic',
+                    'compute_rm_score'
+                ]
                 
-                self.actor_rollout_wg.update_actor = types.MethodType(update_actor, self.actor_rollout_wg)
-                print("[INFO] Added update_actor method to actor_rollout worker group")
-            
-            # Add save_checkpoint method
-            if not hasattr(self.actor_rollout_wg, 'save_checkpoint'):
-                def save_checkpoint(self_wg, local_path, remote_path, **kwargs):
-                    """Forward save_checkpoint to the first worker and wait for result"""
-                    ref = self_wg._workers[0].save_checkpoint.remote(local_path, remote_path, **kwargs)
-                    return ray.get(ref)
-                
-                self.actor_rollout_wg.save_checkpoint = types.MethodType(save_checkpoint, self.actor_rollout_wg)
-                print("[INFO] Added save_checkpoint method to actor_rollout worker group")
-            
-            # Add load_model_parameters method
-            if not hasattr(self.actor_rollout_wg, 'load_model_parameters'):
-                def load_model_parameters(self_wg, source_model_path, **kwargs):
-                    """Forward load_model_parameters to the first worker and wait for result"""
-                    ref = self_wg._workers[0].load_model_parameters.remote(source_model_path, **kwargs)
-                    return ray.get(ref)
-                
-                self.actor_rollout_wg.load_model_parameters = types.MethodType(load_model_parameters, self.actor_rollout_wg)
-                print("[INFO] Added load_model_parameters method to actor_rollout worker group")
-            
-            # Add compute_values method if critic is used
-            if self.use_critic and not hasattr(self.actor_rollout_wg, 'compute_values'):
-                def compute_values(self_wg, batch, **kwargs):
-                    """Forward compute_values to the first worker and wait for result"""
-                    ref = self_wg._workers[0].compute_values.remote(batch, **kwargs)
-                    return ray.get(ref)
-                
-                self.actor_rollout_wg.compute_values = types.MethodType(compute_values, self.actor_rollout_wg)
-                print("[INFO] Added compute_values method to actor_rollout worker group")
-            
-            # Add update_critic method if critic is used
-            if self.use_critic and not hasattr(self.actor_rollout_wg, 'update_critic'):
-                def update_critic(self_wg, batch, **kwargs):
-                    """Forward update_critic to the first worker and wait for result"""
-                    ref = self_wg._workers[0].update_critic.remote(batch, **kwargs)
-                    return ray.get(ref)
-                
-                self.actor_rollout_wg.update_critic = types.MethodType(update_critic, self.actor_rollout_wg)
-                print("[INFO] Added update_critic method to actor_rollout worker group")
-            
-            # Add compute_rm_score method if reward model is used
-            if self.use_rm and not hasattr(self.actor_rollout_wg, 'compute_rm_score'):
-                def compute_rm_score(self_wg, batch, **kwargs):
-                    """Forward compute_rm_score to the first worker and wait for result"""
-                    ref = self_wg._workers[0].compute_rm_score.remote(batch, **kwargs)
-                    return ray.get(ref)
-                
-                self.actor_rollout_wg.compute_rm_score = types.MethodType(compute_rm_score, self.actor_rollout_wg)
-                print("[INFO] Added compute_rm_score method to actor_rollout worker group")
+                # Create proxies for all required methods
+                for method_name in required_methods:
+                    setattr(self.actor_rollout_wg, method_name, create_proxy_method(method_name))
+                    print(f"[INFO] Registered proxy method '{method_name}' on actor_rollout_wg")
+            else:
+                print("[ERROR] Cannot access worker methods: No workers found in the worker group")
         else:
             raise NotImplementedError
 
@@ -968,13 +912,13 @@ class RayPPOTrainer(object):
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:
                         with _timer('values', timing_raw):
-                            values = self.critic_wg.compute_values(batch)
+                            values = self.actor_rollout_wg.compute_values(batch)
                             batch = batch.union(values)
 
                     with _timer('adv', timing_raw):
@@ -983,7 +927,7 @@ class RayPPOTrainer(object):
                         # the results from reward model and rule-based results.
                         if self.use_rm:
                             # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            reward_tensor = self.actor_rollout_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
                         # we combine with rule-based rm
@@ -1009,7 +953,7 @@ class RayPPOTrainer(object):
                     # update critic
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
+                            critic_output = self.actor_rollout_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
                         metrics.update(critic_output_metrics)
 
