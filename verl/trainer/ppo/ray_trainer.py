@@ -727,6 +727,7 @@ class RayPPOTrainer(object):
                         batch.non_tensor_batch['valid_action'][idx] = sum(1 for x in tracking_vars['actions_valid'] if x is not None)
                         batch.non_tensor_batch['effective_action'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None)
                         batch.non_tensor_batch['effective_action_ratio'][idx] = sum(1 for x in tracking_vars['actions_effective'] if x is not None) / len(tracking_vars['actions'])
+
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(final_gen_batch_output)
 
@@ -863,29 +864,29 @@ class RayPPOTrainer(object):
                 start_token_pos = len(start_tokens)
                 end_token_pos = start_token_pos + len(state_tokens)
                 
-                # Set observation tokens to 0 in the action mask (exclude from loss)
                 action_mask[i, start_token_pos:end_token_pos] = 0
         
         # Apply response mask to ensure we only consider valid tokens
         loss_mask = action_mask * response_mask
         batch.batch['loss_mask'] = loss_mask
         
-        # Debug print
-        print("\nRaw batch[0] (before masking):\n", self.tokenizer.decode(batch.batch['responses'][0]))
+        # Debug print with clear labels
+        print("\nRaw batch[0] (complete response):\n", self.tokenizer.decode(batch.batch['responses'][0]))
         response_ids = batch.batch['responses'][0]
+
+        # Tokens with loss_mask=1 are action tokens (included in loss calculation)
+        action_tokens = response_ids[loss_mask[0] == 1]
+        print("\nAction tokens (loss_mask=1, included in loss):\n", self.tokenizer.decode(action_tokens))
         
-        # Now unmasked IDs are action tokens (loss_mask = 1)
-        unmasked_ids = response_ids[loss_mask[0] == 1]
-        print("\nUnmasked batch[0] (action tokens):\n", self.tokenizer.decode(unmasked_ids))
+        # Tokens with loss_mask=0 are observation tokens (excluded from loss calculation)
+        observation_tokens = response_ids[loss_mask[0] == 0]
+        print("\nObservation tokens (loss_mask=0, excluded from loss):\n", self.tokenizer.decode(observation_tokens))
         
-        # Now masked IDs are observation tokens (loss_mask = 0)
-        masked_ids = response_ids[loss_mask[0] == 0]
-        print("\nMasked batch[0] (observation tokens):\n", self.tokenizer.decode(masked_ids))
-        
-        # Update metrics with meaningful names for actions
+        # Update metrics
         metrics.update({
             'action_tokens/total': loss_mask.sum().item(),
             'action_tokens/coverage': (loss_mask.sum() / response_mask.sum()).item(),
+            'observation_tokens/total': (response_mask.sum() - loss_mask.sum()).item(),
         })
         
         return batch, metrics
@@ -1030,3 +1031,4 @@ class RayPPOTrainer(object):
         print("global_metrics", global_metrics)
         self.logger.log(data=global_metrics, step=self.val_num)
         return global_metrics
+    
